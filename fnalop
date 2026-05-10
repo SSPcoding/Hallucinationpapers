@@ -1,0 +1,337 @@
+# ============================================================
+# FINAL RESULT SUMMARY TABLE
+# Shows KG-only vs Hybrid counts and rates clearly
+#
+# Input:
+# - data_final/stage5_hybrid_predictions.csv
+#
+# Output:
+# - data_final/final_result_summary_table.csv
+# - data_final/final_result_summary_metrics.json
+# ============================================================
+
+import os
+import json
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score
+
+DATA_DIR = "data_final"
+
+FINAL_PREDICTIONS_PATH = f"{DATA_DIR}/stage5_hybrid_predictions.csv"
+
+SUMMARY_TABLE_PATH = f"{DATA_DIR}/final_result_summary_table.csv"
+SUMMARY_JSON_PATH = f"{DATA_DIR}/final_result_summary_metrics.json"
+
+assert os.path.exists(FINAL_PREDICTIONS_PATH), f"Missing file: {FINAL_PREDICTIONS_PATH}"
+
+df = pd.read_csv(FINAL_PREDICTIONS_PATH)
+
+print("Loaded final predictions:", len(df))
+print("Columns:", list(df.columns))
+
+
+# ============================================================
+# 1. Keep only evaluated rows
+# ============================================================
+
+eval_df = df[
+    df["stage3_answer_case"] != "UNUSABLE_MODEL_ANSWER"
+].copy()
+
+print("\nEvaluated rows:", len(eval_df))
+
+
+# ============================================================
+# 2. Build gold binary label
+# ============================================================
+# NOT_HALLUCINATION = model answer matches PopQA reference / aliases
+# HALLUCINATION = model answer is wrong
+
+eval_df["gold_binary_label"] = np.where(
+    eval_df["model_answer_matches_reference"] == True,
+    "NOT_HALLUCINATION",
+    "HALLUCINATION"
+)
+
+
+# ============================================================
+# 3. Build KG-only prediction
+# ============================================================
+
+eval_df["kg_only_binary_prediction"] = np.where(
+    eval_df["kg_only_prediction"] == "SUPPORTED_BY_KG_ONLY",
+    "NOT_HALLUCINATION",
+    "HALLUCINATION"
+)
+
+
+# ============================================================
+# 4. Build Hybrid prediction
+# ============================================================
+
+HYBRID_NOT_HALLUCINATION_LABELS = {
+    "SUPPORTED_BY_KG",
+    "VERIFIED_BY_TEXT_EVIDENCE"
+}
+
+eval_df["hybrid_binary_prediction"] = np.where(
+    eval_df["hybrid_final_label"].isin(HYBRID_NOT_HALLUCINATION_LABELS),
+    "NOT_HALLUCINATION",
+    "HALLUCINATION"
+)
+
+
+# ============================================================
+# 5. Main counts
+# ============================================================
+
+correct_model_answers = int(
+    (eval_df["gold_binary_label"] == "NOT_HALLUCINATION").sum()
+)
+
+wrong_model_answers = int(
+    (eval_df["gold_binary_label"] == "HALLUCINATION").sum()
+)
+
+missing_fact_cases = eval_df[
+    eval_df["stage3_answer_case"] == "CORRECT_BUT_FACT_MISSING_FROM_KG"
+].copy()
+
+num_missing_fact_cases = int(len(missing_fact_cases))
+
+
+# KG-only false hallucinations:
+# model answer is correct, but KG-only says hallucination
+
+kg_only_false_hallucinations = eval_df[
+    (eval_df["gold_binary_label"] == "NOT_HALLUCINATION") &
+    (eval_df["kg_only_binary_prediction"] == "HALLUCINATION")
+].copy()
+
+num_kg_only_false_hallucinations = int(len(kg_only_false_hallucinations))
+
+
+# Hybrid false hallucinations:
+# model answer is correct, but hybrid still says hallucination
+
+hybrid_false_hallucinations = eval_df[
+    (eval_df["gold_binary_label"] == "NOT_HALLUCINATION") &
+    (eval_df["hybrid_binary_prediction"] == "HALLUCINATION")
+].copy()
+
+num_hybrid_false_hallucinations = int(len(hybrid_false_hallucinations))
+
+
+# Missing facts recovered:
+# among correct-but-missing facts, hybrid verifies them using text evidence
+
+recovered_missing_facts = missing_fact_cases[
+    missing_fact_cases["hybrid_final_label"] == "VERIFIED_BY_TEXT_EVIDENCE"
+].copy()
+
+num_recovered_missing_facts = int(len(recovered_missing_facts))
+
+
+# Missing facts still missed
+
+still_missed_missing_facts = missing_fact_cases[
+    missing_fact_cases["hybrid_final_label"] != "VERIFIED_BY_TEXT_EVIDENCE"
+].copy()
+
+num_still_missed_missing_facts = int(len(still_missed_missing_facts))
+
+
+# False acceptances:
+# model answer is wrong, but hybrid accepts it as not hallucination
+
+false_acceptances = eval_df[
+    (eval_df["gold_binary_label"] == "HALLUCINATION") &
+    (eval_df["hybrid_binary_prediction"] == "NOT_HALLUCINATION")
+].copy()
+
+num_false_acceptances = int(len(false_acceptances))
+
+
+# ============================================================
+# 6. Rates
+# ============================================================
+
+kg_only_accuracy = accuracy_score(
+    eval_df["gold_binary_label"],
+    eval_df["kg_only_binary_prediction"]
+)
+
+hybrid_accuracy = accuracy_score(
+    eval_df["gold_binary_label"],
+    eval_df["hybrid_binary_prediction"]
+)
+
+kg_only_false_hallucination_rate = (
+    num_kg_only_false_hallucinations / correct_model_answers
+    if correct_model_answers > 0 else 0.0
+)
+
+hybrid_false_hallucination_rate = (
+    num_hybrid_false_hallucinations / correct_model_answers
+    if correct_model_answers > 0 else 0.0
+)
+
+missing_fact_recovery_rate = (
+    num_recovered_missing_facts / num_missing_fact_cases
+    if num_missing_fact_cases > 0 else 0.0
+)
+
+false_acceptance_rate = (
+    num_false_acceptances / wrong_model_answers
+    if wrong_model_answers > 0 else 0.0
+)
+
+
+# ============================================================
+# 7. Final comparison table
+# ============================================================
+
+summary_table = pd.DataFrame([
+    {
+        "method": "KG-only baseline",
+        "accuracy": kg_only_accuracy,
+        "accuracy_percent": round(kg_only_accuracy * 100, 2),
+        "false_hallucinations": num_kg_only_false_hallucinations,
+        "false_hallucination_denominator": correct_model_answers,
+        "false_hallucination_rate": kg_only_false_hallucination_rate,
+        "false_hallucination_rate_percent": round(kg_only_false_hallucination_rate * 100, 2),
+        "missing_facts_recovered": 0,
+        "missing_fact_total": num_missing_fact_cases,
+        "missing_fact_recovery_rate": 0.0,
+        "missing_fact_recovery_rate_percent": 0.0,
+        "false_acceptances": 0,
+        "false_acceptance_denominator": wrong_model_answers,
+        "false_acceptance_rate": 0.0,
+        "false_acceptance_rate_percent": 0.0
+    },
+    {
+        "method": "Hybrid KG + text evidence + NLI",
+        "accuracy": hybrid_accuracy,
+        "accuracy_percent": round(hybrid_accuracy * 100, 2),
+        "false_hallucinations": num_hybrid_false_hallucinations,
+        "false_hallucination_denominator": correct_model_answers,
+        "false_hallucination_rate": hybrid_false_hallucination_rate,
+        "false_hallucination_rate_percent": round(hybrid_false_hallucination_rate * 100, 2),
+        "missing_facts_recovered": num_recovered_missing_facts,
+        "missing_fact_total": num_missing_fact_cases,
+        "missing_fact_recovery_rate": missing_fact_recovery_rate,
+        "missing_fact_recovery_rate_percent": round(missing_fact_recovery_rate * 100, 2),
+        "false_acceptances": num_false_acceptances,
+        "false_acceptance_denominator": wrong_model_answers,
+        "false_acceptance_rate": false_acceptance_rate,
+        "false_acceptance_rate_percent": round(false_acceptance_rate * 100, 2)
+    }
+])
+
+print("\nFinal result summary table:")
+display(summary_table)
+
+
+# ============================================================
+# 8. Reviewer-friendly compact table
+# ============================================================
+
+compact_table = pd.DataFrame([
+    {
+        "Method": "KG-only baseline",
+        "Accuracy": f"{kg_only_accuracy * 100:.2f}%",
+        "False hallucinations": f"{num_kg_only_false_hallucinations} / {correct_model_answers}",
+        "False hallucination rate": f"{kg_only_false_hallucination_rate * 100:.2f}%",
+        "Missing facts recovered": f"0 / {num_missing_fact_cases}",
+        "Recovery rate": "0.00%",
+        "False acceptances": "0"
+    },
+    {
+        "Method": "Hybrid KG + text evidence + NLI",
+        "Accuracy": f"{hybrid_accuracy * 100:.2f}%",
+        "False hallucinations": f"{num_hybrid_false_hallucinations} / {correct_model_answers}",
+        "False hallucination rate": f"{hybrid_false_hallucination_rate * 100:.2f}%",
+        "Missing facts recovered": f"{num_recovered_missing_facts} / {num_missing_fact_cases}",
+        "Recovery rate": f"{missing_fact_recovery_rate * 100:.2f}%",
+        "False acceptances": f"{num_false_acceptances} / {wrong_model_answers}"
+    }
+])
+
+print("\nCompact table for paper/report:")
+display(compact_table)
+
+
+# ============================================================
+# 9. Clear result sentence
+# ============================================================
+
+result_sentence = (
+    f"The KG-only baseline falsely flagged {num_kg_only_false_hallucinations} "
+    f"correct model answers as hallucinations because their facts were missing "
+    f"from the incomplete KG. The hybrid method successfully recovered "
+    f"{num_recovered_missing_facts} of these {num_missing_fact_cases} missing-fact cases, "
+    f"reducing false hallucinations from {num_kg_only_false_hallucinations} to "
+    f"{num_hybrid_false_hallucinations}, with a missing-fact recovery rate of "
+    f"{missing_fact_recovery_rate * 100:.2f}% and only {num_false_acceptances} false acceptance."
+)
+
+print("\nReviewer-friendly result sentence:")
+print(result_sentence)
+
+
+# ============================================================
+# 10. Save outputs
+# ============================================================
+
+summary_table.to_csv(SUMMARY_TABLE_PATH, index=False)
+
+summary_metrics = {
+    "num_evaluated_rows": int(len(eval_df)),
+    "correct_model_answers": correct_model_answers,
+    "wrong_model_answers": wrong_model_answers,
+    "missing_fact_cases": num_missing_fact_cases,
+    "kg_only_accuracy": float(kg_only_accuracy),
+    "hybrid_accuracy": float(hybrid_accuracy),
+    "kg_only_false_hallucinations": num_kg_only_false_hallucinations,
+    "hybrid_false_hallucinations": num_hybrid_false_hallucinations,
+    "kg_only_false_hallucination_rate": float(kg_only_false_hallucination_rate),
+    "hybrid_false_hallucination_rate": float(hybrid_false_hallucination_rate),
+    "missing_facts_recovered": num_recovered_missing_facts,
+    "missing_facts_still_missed": num_still_missed_missing_facts,
+    "missing_fact_recovery_rate": float(missing_fact_recovery_rate),
+    "false_acceptances": num_false_acceptances,
+    "false_acceptance_rate": float(false_acceptance_rate),
+    "result_sentence": result_sentence
+}
+
+with open(SUMMARY_JSON_PATH, "w") as f:
+    json.dump(summary_metrics, f, indent=2)
+
+print("\nSaved summary table:", SUMMARY_TABLE_PATH)
+print("Saved summary metrics:", SUMMARY_JSON_PATH)
+
+
+# ============================================================
+# 11. Optional: save example files for paper discussion
+# ============================================================
+
+recovered_missing_facts.to_csv(
+    f"{DATA_DIR}/final_recovered_missing_fact_examples.csv",
+    index=False
+)
+
+still_missed_missing_facts.to_csv(
+    f"{DATA_DIR}/final_still_missed_missing_fact_examples.csv",
+    index=False
+)
+
+false_acceptances.to_csv(
+    f"{DATA_DIR}/final_false_acceptance_examples.csv",
+    index=False
+)
+
+print("\nSaved example files:")
+print("-", f"{DATA_DIR}/final_recovered_missing_fact_examples.csv")
+print("-", f"{DATA_DIR}/final_still_missed_missing_fact_examples.csv")
+print("-", f"{DATA_DIR}/final_false_acceptance_examples.csv")
