@@ -1,0 +1,437 @@
+# ============================================================
+# STAGE 1 FINAL:
+# Load PopQA, filter to clean relations, build incomplete KG
+#
+# Output files:
+# - data_final/stage1_popqa_clean_relations.csv
+# - data_final/kg_full_clean.csv
+# - data_final/kg_incomplete_clean.csv
+# - data_final/kg_removed_missing_true_clean.csv
+# - data_final/stage1_questions_clean_with_kg_labels.csv
+# - data_final/stage1_clean_metadata.json
+# ============================================================
+
+!pip install -q datasets pandas numpy tqdm
+
+import os
+import json
+import random
+import numpy as np
+import pandas as pd
+
+from datasets import load_dataset, get_dataset_split_names
+
+# -----------------------------
+# Config
+# -----------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+
+DATA_DIR = "data_final"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DATASET_NAME = "akariasai/PopQA"
+
+# Clean relations for final paper
+CLEAN_RELATIONS = [
+    "author",
+    "composer",
+    "director",
+    "producer",
+    "screenwriter",
+    "capital",
+    "place of birth",
+    "country",
+    "developer",
+    "publisher"
+]
+
+# Use full filtered set first.
+# Later, for faster experiments, you can reduce this.
+SAMPLE_SIZE = 2500
+
+# Create incomplete KG by removing this fraction of true triples.
+MISSING_FRACTION = 0.45
+
+# If True, use only low-popularity / long-tail subject entities.
+# For first final run, keep False so we still have enough data.
+LONG_TAIL_ONLY = False
+
+print("Clean relations:", CLEAN_RELATIONS)
+
+
+# ============================================================
+# 1. Load PopQA
+# ============================================================
+
+split_names = get_dataset_split_names(DATASET_NAME)
+print("Available splits:", split_names)
+
+split_to_use = "test" if "test" in split_names else split_names[0]
+print("Using split:", split_to_use)
+
+ds = load_dataset(DATASET_NAME, split=split_to_use)
+df = ds.to_pandas()
+
+print("Raw PopQA rows:", len(df))
+print("Columns:", list(df.columns))
+
+
+# ============================================================
+# 2. Basic cleaning
+# ============================================================
+
+required_cols = [
+    "id",
+    "subj", "prop", "obj",
+    "subj_id", "prop_id", "obj_id",
+    "question", "possible_answers",
+    "s_wiki_title", "o_wiki_title",
+    "s_pop", "o_pop"
+]
+
+missing_cols = [c for c in required_cols if c not in df.columns]
+if missing_cols:
+    raise ValueError(f"Missing expected columns: {missing_cols}")
+
+df = df.dropna(subset=["subj", "prop", "obj", "question"]).copy()
+
+for col in ["subj", "prop", "obj", "subj_id", "prop_id", "obj_id", "question"]:
+    df[col] = df[col].astype(str).str.strip()
+
+df["prop_normalized"] = df["prop"].astype(str).str.lower().str.strip()
+
+df["s_pop"] = pd.to_numeric(df["s_pop"], errors="coerce").fillna(0)
+df["o_pop"] = pd.to_numeric(df["o_pop"], errors="coerce").fillna(0)
+
+df["triple_id"] = (
+    df["subj_id"].astype(str) + "||" +
+    df["prop_id"].astype(str) + "||" +
+    df["obj_id"].astype(str)
+)
+
+df = df.drop_duplicates(subset=["triple_id"]).reset_index(drop=True)
+
+print("Rows after basic cleaning:", len(df))
+
+
+# ============================================================
+# 3. Inspect relation availability
+# ============================================================
+
+print("\nTop PopQA relations:")
+display(df["prop_normalized"].value_counts().head(30).reset_index().rename(
+    columns={"index": "relation", "prop_normalized": "count"}
+))
+
+clean_relation_set = set([r.lower().strip() for r in CLEAN_RELATIONS])
+
+filtered_df = df[df["prop_normalized"].isin(clean_relation_set)].copy().reset_index(drop=True)
+
+print("\nRows after clean-relation filtering:", len(filtered_df))
+print("Relations kept:")
+display(filtered_df["prop_normalized"].value_counts().reset_index().rename(
+    columns={"index": "relation", "prop_normalized": "count"}
+))
+
+if len(filtered_df) == 0:
+    raise ValueError(
+        "No rows matched the clean relations. Inspect df['prop'].unique() and adjust CLEAN_RELATIONS."
+    )
+
+
+# ============================================================
+# 4. Popularity bins for long-tail analysis
+# ============================================================
+
+def make_popularity_bins(series):
+    """
+    Creates low / medium / high popularity bins using ranked quantiles.
+    This is safer when many popularity values are repeated.
+    """
+    try:
+        return pd.qcut(
+            series.rank(method="first"),
+            q=3,
+            labels=["low_popularity", "medium_popularity", "high_popularity"]
+        )
+    except Exception:
+        return pd.Series(["unknown_popularity"] * len(series), index=series.index)
+
+filtered_df["subject_popularity_bin"] = make_popularity_bins(filtered_df["s_pop"])
+filtered_df["object_popularity_bin"] = make_popularity_bins(filtered_df["o_pop"])
+
+print("\nSubject popularity bins:")
+print(filtered_df["subject_popularity_bin"].value_counts())
+
+if LONG_TAIL_ONLY:
+    filtered_df = filtered_df[
+        filtered_df["subject_popularity_bin"] == "low_popularity"
+    ].copy().reset_index(drop=True)
+    print("\nUsing long-tail only.")
+    print("Rows after long-tail filtering:", len(filtered_df))
+
+
+# ============================================================
+# 5. Create a balanced sample across relations and popularity
+# ============================================================
+
+def balanced_sample_by_relation_and_popularity(input_df, sample_size, seed=42):
+    """
+    Samples roughly across relation + subject popularity bin groups.
+    This prevents one relation from dominating the dataset.
+    """
+    if sample_size is None or sample_size >= len(input_df):
+        return input_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    input_df = input_df.copy()
+    input_df["sample_group"] = (
+        input_df["prop_normalized"].astype(str) + "||" +
+        input_df["subject_popularity_bin"].astype(str)
+    )
+
+    groups = list(input_df.groupby("sample_group"))
+    n_groups = len(groups)
+
+    base_per_group = max(1, sample_size // n_groups)
+
+    sampled_parts = []
+
+    for group_name, group in groups:
+        n_take = min(base_per_group, len(group))
+        sampled_parts.append(group.sample(n=n_take, random_state=seed))
+
+    sample_df = pd.concat(sampled_parts).drop_duplicates(subset=["triple_id"])
+
+    # Top up if needed
+    if len(sample_df) < sample_size:
+        remaining = input_df[~input_df["triple_id"].isin(sample_df["triple_id"])]
+        needed = sample_size - len(sample_df)
+        if len(remaining) > 0:
+            topup = remaining.sample(n=min(needed, len(remaining)), random_state=seed)
+            sample_df = pd.concat([sample_df, topup])
+
+    # Trim if needed
+    if len(sample_df) > sample_size:
+        sample_df = sample_df.sample(n=sample_size, random_state=seed)
+
+    sample_df = sample_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    if "sample_group" in sample_df.columns:
+        sample_df = sample_df.drop(columns=["sample_group"])
+
+    return sample_df
+
+sample_df = balanced_sample_by_relation_and_popularity(
+    filtered_df,
+    SAMPLE_SIZE,
+    seed=SEED
+)
+
+print("\nFinal Stage 1 sample rows:", len(sample_df))
+print("Unique relations:", sample_df["prop_normalized"].nunique())
+
+print("\nSample relation distribution:")
+display(sample_df["prop_normalized"].value_counts().reset_index().rename(
+    columns={"index": "relation", "prop_normalized": "count"}
+))
+
+print("\nSample subject popularity distribution:")
+print(sample_df["subject_popularity_bin"].value_counts())
+
+
+# ============================================================
+# 6. Build full local KG
+# ============================================================
+
+kg_full = sample_df[[
+    "triple_id",
+    "subj_id", "subj",
+    "prop_id", "prop",
+    "prop_normalized",
+    "obj_id", "obj",
+    "s_pop", "o_pop",
+    "subject_popularity_bin",
+    "object_popularity_bin",
+    "s_wiki_title",
+    "o_wiki_title"
+]].copy()
+
+kg_full = kg_full.rename(columns={
+    "subj_id": "subject_id",
+    "subj": "subject_label",
+    "prop_id": "relation_id",
+    "prop": "relation_label",
+    "prop_normalized": "relation_normalized",
+    "obj_id": "object_id",
+    "obj": "object_label"
+})
+
+print("\nFull clean KG triples:", len(kg_full))
+display(kg_full.head())
+
+
+# ============================================================
+# 7. Create incomplete KG
+# ============================================================
+
+sample_df["removal_group"] = (
+    sample_df["prop_normalized"].astype(str) + "||" +
+    sample_df["subject_popularity_bin"].astype(str)
+)
+
+removed_parts = []
+
+for group_name, group in sample_df.groupby("removal_group"):
+    n_remove = int(round(len(group) * MISSING_FRACTION))
+
+    # Avoid very tiny groups being wiped out.
+    if len(group) >= 3 and n_remove >= 1:
+        removed_parts.append(group.sample(n=n_remove, random_state=SEED))
+
+if len(removed_parts) > 0:
+    removed_df = pd.concat(removed_parts).drop_duplicates(subset=["triple_id"]).reset_index(drop=True)
+else:
+    removed_df = pd.DataFrame(columns=sample_df.columns)
+
+kept_df = sample_df[
+    ~sample_df["triple_id"].isin(removed_df["triple_id"])
+].copy().reset_index(drop=True)
+
+kg_removed = kg_full[
+    kg_full["triple_id"].isin(removed_df["triple_id"])
+].copy().reset_index(drop=True)
+
+kg_incomplete = kg_full[
+    kg_full["triple_id"].isin(kept_df["triple_id"])
+].copy().reset_index(drop=True)
+
+actual_missing_fraction = len(kg_removed) / len(kg_full) if len(kg_full) > 0 else 0
+
+print("\nOriginal clean KG triples:", len(kg_full))
+print("Incomplete clean KG triples:", len(kg_incomplete))
+print("Removed true triples:", len(kg_removed))
+print("Actual missing fraction:", round(actual_missing_fraction, 4))
+
+
+# ============================================================
+# 8. Build labelled question file
+# ============================================================
+
+stage1_questions = sample_df.copy()
+
+stage1_questions["gold_kg_label"] = np.where(
+    stage1_questions["triple_id"].isin(kg_incomplete["triple_id"]),
+    "KG_SUPPORTED",
+    "MISSING_BUT_TRUE"
+)
+
+stage1_questions = stage1_questions[[
+    "id",
+    "question",
+    "subj_id", "subj",
+    "prop_id", "prop", "prop_normalized",
+    "obj_id", "obj",
+    "possible_answers",
+    "s_wiki_title", "o_wiki_title",
+    "s_pop", "o_pop",
+    "subject_popularity_bin",
+    "object_popularity_bin",
+    "triple_id",
+    "gold_kg_label"
+]].copy()
+
+stage1_questions = stage1_questions.rename(columns={
+    "subj_id": "subject_id",
+    "subj": "subject_label",
+    "prop_id": "relation_id",
+    "prop": "relation_label",
+    "prop_normalized": "relation_normalized",
+    "obj_id": "gold_object_id",
+    "obj": "gold_object_label"
+})
+
+print("\nGold KG label distribution:")
+print(stage1_questions["gold_kg_label"].value_counts())
+
+print("\nGold KG label by relation:")
+display(pd.crosstab(
+    stage1_questions["relation_normalized"],
+    stage1_questions["gold_kg_label"]
+))
+
+
+# ============================================================
+# 9. Save outputs
+# ============================================================
+
+sample_df.to_csv(f"{DATA_DIR}/stage1_popqa_clean_relations.csv", index=False)
+kg_full.to_csv(f"{DATA_DIR}/kg_full_clean.csv", index=False)
+kg_incomplete.to_csv(f"{DATA_DIR}/kg_incomplete_clean.csv", index=False)
+kg_removed.to_csv(f"{DATA_DIR}/kg_removed_missing_true_clean.csv", index=False)
+stage1_questions.to_csv(f"{DATA_DIR}/stage1_questions_clean_with_kg_labels.csv", index=False)
+
+metadata = {
+    "dataset": DATASET_NAME,
+    "split_used": split_to_use,
+    "random_seed": SEED,
+    "clean_relations": CLEAN_RELATIONS,
+    "long_tail_only": LONG_TAIL_ONLY,
+    "raw_popqa_rows": int(len(df)),
+    "rows_after_clean_relation_filtering": int(len(filtered_df)),
+    "sample_size": int(len(sample_df)),
+    "full_kg_triples": int(len(kg_full)),
+    "incomplete_kg_triples": int(len(kg_incomplete)),
+    "removed_true_triples": int(len(kg_removed)),
+    "missing_fraction_requested": float(MISSING_FRACTION),
+    "missing_fraction_actual": float(actual_missing_fraction),
+    "relation_distribution": sample_df["prop_normalized"].value_counts().to_dict(),
+    "subject_popularity_distribution": sample_df["subject_popularity_bin"].value_counts().astype(int).to_dict(),
+    "labels": {
+        "KG_SUPPORTED": "Gold triple exists in the incomplete KG.",
+        "MISSING_BUT_TRUE": "Gold triple was removed from the KG but remains a true fact."
+    },
+    "output_files": {
+        "stage1_sample": f"{DATA_DIR}/stage1_popqa_clean_relations.csv",
+        "kg_full": f"{DATA_DIR}/kg_full_clean.csv",
+        "kg_incomplete": f"{DATA_DIR}/kg_incomplete_clean.csv",
+        "kg_removed": f"{DATA_DIR}/kg_removed_missing_true_clean.csv",
+        "questions_with_labels": f"{DATA_DIR}/stage1_questions_clean_with_kg_labels.csv"
+    }
+}
+
+with open(f"{DATA_DIR}/stage1_clean_metadata.json", "w") as f:
+    json.dump(metadata, f, indent=2)
+
+print("\nSaved Stage 1 final files:")
+for file in os.listdir(DATA_DIR):
+    print("-", file)
+
+print("\nMetadata:")
+print(json.dumps(metadata, indent=2))
+
+
+# ============================================================
+# 10. Quick examples
+# ============================================================
+
+print("\nExample KG-supported questions:")
+display(stage1_questions[stage1_questions["gold_kg_label"] == "KG_SUPPORTED"][[
+    "question",
+    "subject_label",
+    "relation_label",
+    "gold_object_label",
+    "subject_popularity_bin",
+    "gold_kg_label"
+]].head(5))
+
+print("\nExample missing-but-true questions:")
+display(stage1_questions[stage1_questions["gold_kg_label"] == "MISSING_BUT_TRUE"][[
+    "question",
+    "subject_label",
+    "relation_label",
+    "gold_object_label",
+    "subject_popularity_bin",
+    "gold_kg_label"
+]].head(5))
