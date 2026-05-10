@@ -1,0 +1,1006 @@
+# ============================================================
+# STAGE 4 FINAL CLEAN:
+# Wikipedia evidence retrieval for KG-only flagged model answers
+#
+# Input:
+# - data_final/stage3_kg_only_predictions.csv
+#
+# Output:
+# - data_final/stage4_claims_with_evidence.csv
+# - data_final/stage4_evidence_corpus.csv
+# - data_final/stage4_wikipedia_cache.json
+# - data_final/stage4_retrieval_metadata.json
+#
+# Main fixes:
+# - row_index now points to the ORIGINAL Stage 3 row index.
+# - Uses current human-friendly Stage 2/3 labels.
+# - Keeps Wikipedia-only evidence source.
+# - Adds answer/relation grounding filters.
+# - Keeps relation-only evidence because it is useful for contradiction detection.
+# - Removes unnecessary old labels and old output naming.
+# ============================================================
+
+!pip install -q pandas numpy tqdm wikipedia-api rank_bm25 sentence-transformers
+
+import os
+import re
+import ast
+import json
+import time
+import gc
+import unicodedata
+import numpy as np
+import pandas as pd
+import torch
+
+from tqdm.auto import tqdm
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import wikipediaapi
+
+
+# ============================================================
+# 0. Free GPU memory if previous models are still loaded
+# ============================================================
+
+for obj_name in ["model", "tokenizer", "embedding_model", "reranker_model"]:
+    try:
+        del globals()[obj_name]
+    except Exception:
+        pass
+
+gc.collect()
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+
+# ============================================================
+# 1. Config
+# ============================================================
+
+DATA_DIR = "data_final"
+
+STAGE3_PATH = f"{DATA_DIR}/stage3_kg_only_predictions.csv"
+
+CACHE_PATH = f"{DATA_DIR}/stage4_wikipedia_cache.json"
+EVIDENCE_CORPUS_PATH = f"{DATA_DIR}/stage4_evidence_corpus.csv"
+STAGE4_OUTPUT_PATH = f"{DATA_DIR}/stage4_claims_with_evidence.csv"
+STAGE4_METADATA_PATH = f"{DATA_DIR}/stage4_retrieval_metadata.json"
+
+EMBEDDING_MODEL_NAME = "BAAI/bge-base-en-v1.5"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
+
+BM25_CANDIDATES = 30
+DENSE_CANDIDATES = 30
+RERANK_CANDIDATES = 40
+TOP_EVIDENCE_PER_CLAIM = 5
+
+KG_ONLY_FLAGGED_LABEL = "FLAGGED_AS_HALLUCINATION_BY_KG_ONLY"
+KG_ONLY_SUPPORTED_LABEL = "SUPPORTED_BY_KG_ONLY"
+UNUSABLE_ANSWER_CASE = "UNUSABLE_MODEL_ANSWER"
+
+assert os.path.exists(STAGE3_PATH), f"Stage 3 output not found: {STAGE3_PATH}"
+
+print("Using Stage 3 file:", STAGE3_PATH)
+
+
+# ============================================================
+# 2. Load Stage 3 and validate columns
+# ============================================================
+
+stage3_df = pd.read_csv(STAGE3_PATH)
+
+# Preserve original Stage 3 row index.
+# This is the key fix.
+if "row_index" in stage3_df.columns:
+    stage3_df = stage3_df.rename(columns={"row_index": "old_row_index"})
+
+stage3_df.insert(0, "row_index", range(len(stage3_df)))
+
+required_cols = [
+    "row_index",
+    "id",
+    "question",
+    "subject_label",
+    "relation_label",
+    "relation_normalized",
+    "reference_answer",
+    "popqa_possible_answers",
+    "s_wiki_title",
+    "subject_popularity_bin",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "model_answer_matches_reference",
+    "answer_case",
+    "stage3_answer_case",
+    "kg_fact_status_checked",
+    "kg_only_prediction"
+]
+
+missing_cols = [c for c in required_cols if c not in stage3_df.columns]
+if missing_cols:
+    raise ValueError(f"Missing required Stage 3 columns: {missing_cols}")
+
+print("Stage 3 rows:", len(stage3_df))
+
+print("\nKG-only prediction distribution:")
+print(stage3_df["kg_only_prediction"].value_counts())
+
+print("\nStage 3 answer case distribution:")
+print(stage3_df["stage3_answer_case"].value_counts())
+
+print("\nKG fact status distribution:")
+print(stage3_df["kg_fact_status_checked"].value_counts())
+
+
+# ============================================================
+# 3. Select rows needing evidence verification
+# ============================================================
+
+verify_df = stage3_df[
+    (stage3_df["kg_only_prediction"] == KG_ONLY_FLAGGED_LABEL) &
+    (stage3_df["stage3_answer_case"] != UNUSABLE_ANSWER_CASE)
+].copy()
+
+# Keep original Stage 3 row_index.
+# Add separate verification_row_index only for audit/debugging.
+verify_df = verify_df.reset_index(drop=True)
+verify_df["verification_row_index"] = verify_df.index
+
+print("\nRows needing evidence verification:", len(verify_df))
+print(verify_df["stage3_answer_case"].value_counts())
+
+
+# ============================================================
+# 4. Text normalization helpers
+# ============================================================
+
+def strip_accents(text):
+    text = str(text)
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def normalize_text(text):
+    if pd.isna(text):
+        return ""
+
+    text = str(text).strip()
+    text = strip_accents(text)
+    text = text.lower()
+    text = text.replace("_", " ")
+    text = text.replace("-", " ")
+    text = re.sub(r"[\“\”\‘\’\"']", "", text)
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def compact_text(text):
+    return re.sub(r"[^a-z0-9]", "", normalize_text(text))
+
+
+def parse_list_like(value):
+    if isinstance(value, list):
+        return [str(x) for x in value]
+
+    if pd.isna(value):
+        return []
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    try:
+        parsed = ast.literal_eval(text)
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
+        if isinstance(parsed, tuple):
+            return [str(x) for x in parsed]
+        return [str(parsed)]
+    except Exception:
+        text = text.strip("[]")
+        parts = re.split(r",|\|", text)
+        return [p.strip().strip("'").strip('"') for p in parts if p.strip()]
+
+
+def clean_answer_for_claim(answer):
+    if pd.isna(answer):
+        return ""
+
+    answer = str(answer).strip()
+    answer = answer.split("\n")[0].strip()
+    answer = answer.replace("_", " ")
+    answer = re.sub(r"\s+", " ", answer)
+    answer = answer.strip(" .;:")
+
+    return answer
+
+
+def make_search_terms(values):
+    terms = set()
+
+    for value in values:
+        if pd.isna(value):
+            continue
+
+        raw = str(value).strip()
+        if not raw:
+            continue
+
+        norm = normalize_text(raw)
+        comp = compact_text(raw)
+
+        if norm:
+            terms.add(norm)
+
+        if comp and len(comp) >= 3:
+            terms.add(comp)
+
+    return sorted(terms, key=len, reverse=True)
+
+
+def text_contains_term(text, term):
+    if not term:
+        return False
+
+    norm_text = normalize_text(text)
+    comp_text = compact_text(text)
+
+    norm_term = normalize_text(term)
+    comp_term = compact_text(term)
+
+    if not norm_term and not comp_term:
+        return False
+
+    # For very short terms, require word-boundary match.
+    if len(comp_term) < 4:
+        pattern = r"\b" + re.escape(norm_term) + r"\b"
+        return re.search(pattern, norm_text) is not None
+
+    if norm_term and norm_term in norm_text:
+        return True
+
+    if comp_term and comp_term in comp_text:
+        return True
+
+    return False
+
+
+def text_contains_any_term(text, terms):
+    for term in terms:
+        if text_contains_term(text, term):
+            return True, term
+    return False, ""
+
+
+# ============================================================
+# 5. Claim creation
+# ============================================================
+
+def verbalize_claim(subject, relation, answer):
+    subject = str(subject).strip()
+    relation = str(relation).strip().lower()
+    answer = clean_answer_for_claim(answer)
+
+    templates = {
+        "author": "{subject} was written by {answer}.",
+        "composer": "{subject} was composed by {answer}.",
+        "director": "{subject} was directed by {answer}.",
+        "producer": "{subject} was produced by {answer}.",
+        "screenwriter": "{subject} was written by {answer}.",
+        "capital": "The capital of {subject} is {answer}.",
+        "place of birth": "{subject} was born in {answer}.",
+        "country": "{subject} is associated with the country {answer}.",
+        "developer": "{subject} was developed by {answer}.",
+        "publisher": "{subject} was published by {answer}."
+    }
+
+    if relation in templates:
+        return templates[relation].format(subject=subject, answer=answer)
+
+    return f"The {relation} of {subject} is {answer}."
+
+
+verify_df["model_clean_answer"] = verify_df["model_extracted_answer"].apply(clean_answer_for_claim)
+
+verify_df["claim"] = verify_df.apply(
+    lambda row: verbalize_claim(
+        row["subject_label"],
+        row["relation_normalized"],
+        row["model_clean_answer"]
+    ),
+    axis=1
+)
+
+# Remove rows with empty model answer.
+verify_df = verify_df[
+    verify_df["model_clean_answer"].astype(str).str.strip() != ""
+].copy().reset_index(drop=True)
+
+verify_df["verification_row_index"] = verify_df.index
+
+print("\nRows after removing empty claims:", len(verify_df))
+
+
+# ============================================================
+# 6. Build grounding terms
+# ============================================================
+
+def build_answer_grounding_terms(row):
+    """
+    For wrong model answers:
+    - Use only the model answer.
+
+    For correct-but-KG-missing answers:
+    - Use model answer plus PopQA reference/possible answers.
+    - This helps cases like USA vs United States.
+
+    No manual alias dictionary is used.
+    """
+
+    terms = []
+
+    model_answer = clean_answer_for_claim(row["model_clean_answer"])
+    if model_answer:
+        terms.append(model_answer)
+
+    model_matches_reference = bool(row["model_answer_matches_reference"])
+
+    if model_matches_reference:
+        terms.append(str(row.get("reference_answer", "")))
+
+        matched = row.get("matched_reference_answer", "")
+        if not pd.isna(matched) and str(matched).strip():
+            terms.append(str(matched))
+
+        for ans in parse_list_like(row.get("popqa_possible_answers", "")):
+            terms.append(ans)
+
+    return make_search_terms(terms)
+
+
+RELATION_KEYWORDS = {
+    "author": [
+        "written by", "authored by", "author", "writer", "novel by", "book by"
+    ],
+    "composer": [
+        "composed by", "composer", "music by", "written by", "song by"
+    ],
+    "director": [
+        "directed by", "director"
+    ],
+    "producer": [
+        "produced by", "producer"
+    ],
+    "screenwriter": [
+        "written by", "screenplay by", "screenwriter", "writer", "script by"
+    ],
+    "capital": [
+        "capital", "capital city", "administrative centre", "administrative center", "seat"
+    ],
+    "place of birth": [
+        "born in", "born at", "birthplace", "place of birth"
+    ],
+    "country": [
+        "country", "located in", "based in", "headquartered in",
+        "village in", "town in", "city in", "commune in",
+        "airport in", "river in", "municipality in", "province in"
+    ],
+    "developer": [
+        "developed by", "developer", "created by"
+    ],
+    "publisher": [
+        "published by", "publisher"
+    ]
+}
+
+
+def build_relation_grounding_terms(relation):
+    relation = str(relation).strip().lower()
+    terms = RELATION_KEYWORDS.get(relation, [relation])
+    return make_search_terms(terms)
+
+
+verify_df["answer_grounding_terms"] = verify_df.apply(
+    build_answer_grounding_terms,
+    axis=1
+)
+
+verify_df["relation_grounding_terms"] = verify_df["relation_normalized"].apply(
+    build_relation_grounding_terms
+)
+
+display(verify_df[[
+    "row_index",
+    "verification_row_index",
+    "question",
+    "subject_label",
+    "relation_normalized",
+    "reference_answer",
+    "model_raw_answer",
+    "model_clean_answer",
+    "claim",
+    "stage3_answer_case",
+    "kg_fact_status_checked",
+    "s_wiki_title",
+    "answer_grounding_terms"
+]].head(15))
+
+
+# ============================================================
+# 7. Fetch subject Wikipedia pages
+# ============================================================
+
+wiki = wikipediaapi.Wikipedia(
+    language="en",
+    user_agent="KGIncompletenessHallucinationResearch/1.0"
+)
+
+if os.path.exists(CACHE_PATH):
+    with open(CACHE_PATH, "r") as f:
+        wiki_cache = json.load(f)
+else:
+    wiki_cache = {}
+
+print("\nCached pages before fetching:", len(wiki_cache))
+
+
+def fetch_wikipedia_page_text(title, sleep_time=0.05):
+    if pd.isna(title) or str(title).strip() == "":
+        return ""
+
+    title = str(title).strip()
+
+    if title in wiki_cache:
+        return wiki_cache[title]
+
+    try:
+        page = wiki.page(title)
+
+        if page.exists():
+            text = page.text or ""
+        else:
+            text = ""
+
+        wiki_cache[title] = text
+        time.sleep(sleep_time)
+
+        return text
+
+    except Exception as e:
+        print(f"Error fetching {title}: {e}")
+        wiki_cache[title] = ""
+        return ""
+
+
+unique_titles = sorted(
+    verify_df["s_wiki_title"]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .unique()
+)
+
+print("Unique subject Wikipedia titles:", len(unique_titles))
+
+for title in tqdm(unique_titles):
+    _ = fetch_wikipedia_page_text(title)
+
+with open(CACHE_PATH, "w") as f:
+    json.dump(wiki_cache, f)
+
+print("Cached pages after fetching:", len(wiki_cache))
+print("Saved cache:", CACHE_PATH)
+
+
+# ============================================================
+# 8. Build evidence corpus
+# ============================================================
+
+def clean_wiki_text(text):
+    if pd.isna(text):
+        return ""
+
+    text = str(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+
+    return text.strip()
+
+
+def chunk_text(text, max_words=120, min_words=20):
+    text = clean_wiki_text(text)
+
+    if not text:
+        return []
+
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks = []
+
+    for para in paragraphs:
+        words = para.split()
+
+        if len(words) < min_words:
+            continue
+
+        if len(words) <= max_words:
+            chunks.append(para)
+        else:
+            step = max_words // 2
+
+            for start in range(0, len(words), step):
+                sub_words = words[start:start + max_words]
+
+                if len(sub_words) >= min_words:
+                    chunks.append(" ".join(sub_words))
+
+    return chunks
+
+
+corpus_rows = []
+
+needed_title_set = set(unique_titles)
+
+for title in tqdm(unique_titles):
+    text = wiki_cache.get(title, "")
+    chunks = chunk_text(text)
+
+    for i, chunk in enumerate(chunks):
+        corpus_rows.append({
+            "doc_id": f"{title}::chunk_{i}",
+            "wiki_title": title,
+            "chunk_index": i,
+            "text": chunk
+        })
+
+evidence_corpus = pd.DataFrame(corpus_rows)
+
+if len(evidence_corpus) == 0:
+    raise ValueError("No evidence chunks created. Check Wikipedia page fetching.")
+
+evidence_corpus.to_csv(EVIDENCE_CORPUS_PATH, index=False)
+
+print("\nEvidence chunks:", len(evidence_corpus))
+print("Saved evidence corpus:", EVIDENCE_CORPUS_PATH)
+
+display(evidence_corpus.head(5))
+
+
+# ============================================================
+# 9. Load retrieval models
+# ============================================================
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("\nDevice:", device)
+
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
+reranker_model = CrossEncoder(RERANKER_MODEL_NAME, device=device)
+
+print("Loaded embedding model:", EMBEDDING_MODEL_NAME)
+print("Loaded reranker model:", RERANKER_MODEL_NAME)
+
+
+# ============================================================
+# 10. Build dense embeddings for corpus
+# ============================================================
+
+corpus_texts = evidence_corpus["text"].fillna("").astype(str).tolist()
+
+corpus_embeddings = embedding_model.encode(
+    corpus_texts,
+    batch_size=32 if device == "cuda" else 8,
+    show_progress_bar=True,
+    convert_to_numpy=True,
+    normalize_embeddings=True
+)
+
+print("Corpus embeddings shape:", corpus_embeddings.shape)
+
+
+# ============================================================
+# 11. Retrieval helpers
+# ============================================================
+
+def bm25_tokenize(text):
+    text = normalize_text(text)
+    return text.split()
+
+
+def retrieve_subject_page_candidates(row, bm25_k=30, dense_k=30):
+    query = row["claim"]
+    subject_title = str(row.get("s_wiki_title", "")).strip()
+
+    subject_chunks = evidence_corpus[
+        evidence_corpus["wiki_title"].astype(str).str.strip() == subject_title
+    ].copy()
+
+    if len(subject_chunks) == 0:
+        return []
+
+    local_indices = subject_chunks.index.to_numpy()
+    local_texts = subject_chunks["text"].fillna("").astype(str).tolist()
+
+    # BM25 retrieval
+    local_tokens = [bm25_tokenize(text) for text in local_texts]
+    local_bm25 = BM25Okapi(local_tokens)
+    query_tokens = bm25_tokenize(query)
+    bm25_scores = local_bm25.get_scores(query_tokens)
+
+    bm25_order = np.argsort(bm25_scores)[::-1][:min(bm25_k, len(local_indices))]
+
+    # Dense retrieval
+    local_embeddings = corpus_embeddings[local_indices]
+
+    query_embedding = embedding_model.encode(
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )[0]
+
+    dense_scores = np.dot(local_embeddings, query_embedding)
+    dense_order = np.argsort(dense_scores)[::-1][:min(dense_k, len(local_indices))]
+
+    merged = {}
+
+    for local_pos in bm25_order:
+        global_idx = int(local_indices[local_pos])
+        merged[global_idx] = {
+            "global_idx": global_idx,
+            "doc_id": evidence_corpus.loc[global_idx, "doc_id"],
+            "wiki_title": evidence_corpus.loc[global_idx, "wiki_title"],
+            "text": evidence_corpus.loc[global_idx, "text"],
+            "bm25_score": float(bm25_scores[local_pos]),
+            "dense_score": float(dense_scores[local_pos]),
+        }
+
+    for local_pos in dense_order:
+        global_idx = int(local_indices[local_pos])
+
+        if global_idx not in merged:
+            merged[global_idx] = {
+                "global_idx": global_idx,
+                "doc_id": evidence_corpus.loc[global_idx, "doc_id"],
+                "wiki_title": evidence_corpus.loc[global_idx, "wiki_title"],
+                "text": evidence_corpus.loc[global_idx, "text"],
+                "bm25_score": float(bm25_scores[local_pos]),
+                "dense_score": float(dense_scores[local_pos]),
+            }
+        else:
+            merged[global_idx]["dense_score"] = float(dense_scores[local_pos])
+
+    return list(merged.values())
+
+
+def rerank_candidates(query, candidates, max_candidates=40):
+    if len(candidates) == 0:
+        return []
+
+    # Keep candidate count bounded.
+    candidates = candidates[:max_candidates]
+
+    pairs = [[query, c["text"]] for c in candidates]
+
+    scores = reranker_model.predict(
+        pairs,
+        batch_size=16 if device == "cuda" else 4,
+        show_progress_bar=False
+    )
+
+    for c, score in zip(candidates, scores):
+        c["reranker_score"] = float(score)
+
+    return sorted(
+        candidates,
+        key=lambda x: x["reranker_score"],
+        reverse=True
+    )
+
+
+def classify_evidence_strength(evidence_text, answer_terms, relation_terms):
+    answer_hit, matched_answer = text_contains_any_term(evidence_text, answer_terms)
+    relation_hit, matched_relation = text_contains_any_term(evidence_text, relation_terms)
+
+    if answer_hit and relation_hit:
+        strength = "STRONG_ANSWER_AND_RELATION_MATCH"
+    elif answer_hit:
+        strength = "ANSWER_ONLY_MATCH"
+    elif relation_hit:
+        strength = "RELATION_ONLY_MATCH"
+    else:
+        strength = "NO_EVIDENCE"
+
+    return {
+        "evidence_strength": strength,
+        "answer_grounded_in_evidence": bool(answer_hit),
+        "relation_grounded_in_evidence": bool(relation_hit),
+        "matched_answer_term": matched_answer,
+        "matched_relation_keyword": matched_relation
+    }
+
+
+def retrieve_evidence_for_row(row):
+    candidates = retrieve_subject_page_candidates(
+        row,
+        bm25_k=BM25_CANDIDATES,
+        dense_k=DENSE_CANDIDATES
+    )
+
+    if len(candidates) == 0:
+        return [], "no_subject_page_evidence"
+
+    reranked = rerank_candidates(
+        row["claim"],
+        candidates,
+        max_candidates=RERANK_CANDIDATES
+    )
+
+    scored = []
+
+    for c in reranked:
+        grounding = classify_evidence_strength(
+            c["text"],
+            row["answer_grounding_terms"],
+            row["relation_grounding_terms"]
+        )
+
+        c.update(grounding)
+
+        # Keep useful evidence:
+        # - answer evidence can support missing facts
+        # - relation-only evidence can contradict wrong answers
+        if c["evidence_strength"] != "NO_EVIDENCE":
+            scored.append(c)
+
+    if len(scored) == 0:
+        return [], "no_filtered_evidence"
+
+    return scored[:TOP_EVIDENCE_PER_CLAIM], "subject_page_filtered"
+
+
+# ============================================================
+# 12. Retrieve evidence for verification rows
+# ============================================================
+
+retrieved_rows = []
+
+for _, row in tqdm(verify_df.iterrows(), total=len(verify_df)):
+    results, retrieval_scope = retrieve_evidence_for_row(row)
+
+    base_row = {
+        "row_index": int(row["row_index"]),  # ORIGINAL Stage 3 row index
+        "verification_row_index": int(row["verification_row_index"]),
+        "id": row["id"],
+        "question": row["question"],
+        "subject_label": row["subject_label"],
+        "relation_label": row["relation_label"],
+        "relation_normalized": row["relation_normalized"],
+        "reference_answer": row["reference_answer"],
+        "popqa_possible_answers": row["popqa_possible_answers"],
+        "model_raw_answer": row["model_raw_answer"],
+        "model_extracted_answer": row["model_extracted_answer"],
+        "model_clean_answer": row["model_clean_answer"],
+        "claim": row["claim"],
+        "model_answer_matches_reference": bool(row["model_answer_matches_reference"]),
+        "answer_case": row["answer_case"],
+        "stage3_answer_case": row["stage3_answer_case"],
+        "kg_fact_status_checked": row["kg_fact_status_checked"],
+        "kg_only_prediction": row["kg_only_prediction"],
+        "subject_popularity_bin": row["subject_popularity_bin"],
+        "s_wiki_title": row["s_wiki_title"],
+        "answer_grounding_terms": json.dumps(row["answer_grounding_terms"], ensure_ascii=False),
+        "relation_grounding_terms": json.dumps(row["relation_grounding_terms"], ensure_ascii=False),
+    }
+
+    if len(results) == 0:
+        retrieved_rows.append({
+            **base_row,
+            "evidence_rank": 0,
+            "evidence_doc_id": "",
+            "evidence_wiki_title": "",
+            "evidence_text": "",
+            "bm25_score": 0.0,
+            "dense_score": 0.0,
+            "reranker_score": 0.0,
+            "retrieval_scope": retrieval_scope,
+            "evidence_strength": "NO_EVIDENCE",
+            "answer_grounded_in_evidence": False,
+            "relation_grounded_in_evidence": False,
+            "matched_answer_term": "",
+            "matched_relation_keyword": ""
+        })
+        continue
+
+    for rank, result in enumerate(results, start=1):
+        retrieved_rows.append({
+            **base_row,
+            "evidence_rank": rank,
+            "evidence_doc_id": result["doc_id"],
+            "evidence_wiki_title": result["wiki_title"],
+            "evidence_text": result["text"],
+            "bm25_score": result["bm25_score"],
+            "dense_score": result["dense_score"],
+            "reranker_score": result["reranker_score"],
+            "retrieval_scope": retrieval_scope,
+            "evidence_strength": result["evidence_strength"],
+            "answer_grounded_in_evidence": bool(result["answer_grounded_in_evidence"]),
+            "relation_grounded_in_evidence": bool(result["relation_grounded_in_evidence"]),
+            "matched_answer_term": result["matched_answer_term"],
+            "matched_relation_keyword": result["matched_relation_keyword"]
+        })
+
+retrieved_evidence_df = pd.DataFrame(retrieved_rows)
+
+
+# ============================================================
+# 13. Safety checks for row alignment
+# ============================================================
+
+if retrieved_evidence_df["row_index"].min() < 0:
+    raise ValueError("Invalid row_index: contains negative values.")
+
+if retrieved_evidence_df["row_index"].max() >= len(stage3_df):
+    raise ValueError("Invalid row_index: exceeds Stage 3 row count.")
+
+alignment_check = retrieved_evidence_df.merge(
+    stage3_df[["row_index", "id", "question"]],
+    on="row_index",
+    how="left",
+    suffixes=("", "_stage3")
+)
+
+id_mismatch_count = int(
+    (alignment_check["id"].astype(str) != alignment_check["id_stage3"].astype(str)).sum()
+)
+
+question_mismatch_count = int(
+    (alignment_check["question"].astype(str) != alignment_check["question_stage3"].astype(str)).sum()
+)
+
+if id_mismatch_count != 0 or question_mismatch_count != 0:
+    raise ValueError(
+        f"Stage 4 row alignment failed. "
+        f"ID mismatches: {id_mismatch_count}, "
+        f"question mismatches: {question_mismatch_count}"
+    )
+
+print("\nRow alignment check passed.")
+print("ID mismatch count:", id_mismatch_count)
+print("Question mismatch count:", question_mismatch_count)
+
+
+# ============================================================
+# 14. Save Stage 4 outputs
+# ============================================================
+
+retrieved_evidence_df.to_csv(STAGE4_OUTPUT_PATH, index=False)
+
+print("\nSaved Stage 4 evidence:", STAGE4_OUTPUT_PATH)
+
+print("\nRetrieved evidence rows:", len(retrieved_evidence_df))
+print("Unique original Stage 3 rows with evidence records:", retrieved_evidence_df["row_index"].nunique())
+print("row_index min:", int(retrieved_evidence_df["row_index"].min()))
+print("row_index max:", int(retrieved_evidence_df["row_index"].max()))
+
+print("\nRetrieval scope counts:")
+print(retrieved_evidence_df["retrieval_scope"].value_counts())
+
+print("\nEvidence strength counts:")
+print(retrieved_evidence_df["evidence_strength"].value_counts())
+
+print("\nAnswer-grounded evidence counts:")
+print(retrieved_evidence_df["answer_grounded_in_evidence"].value_counts())
+
+print("\nRelation-grounded evidence counts:")
+print(retrieved_evidence_df["relation_grounded_in_evidence"].value_counts())
+
+print("\nClean evidence preview:")
+display(retrieved_evidence_df[[
+    "row_index",
+    "verification_row_index",
+    "claim",
+    "stage3_answer_case",
+    "evidence_rank",
+    "evidence_wiki_title",
+    "retrieval_scope",
+    "evidence_strength",
+    "answer_grounded_in_evidence",
+    "relation_grounded_in_evidence",
+    "matched_answer_term",
+    "matched_relation_keyword",
+    "reranker_score",
+    "evidence_text"
+]].head(25))
+
+
+# ============================================================
+# 15. Save metadata
+# ============================================================
+
+def value_counts_dict(series):
+    return {str(k): int(v) for k, v in series.value_counts().to_dict().items()}
+
+
+metadata = {
+    "stage": "Stage 4 Final Clean Wikipedia Evidence Retrieval",
+    "input_file": STAGE3_PATH,
+    "output_file": STAGE4_OUTPUT_PATH,
+    "cache_file": CACHE_PATH,
+    "evidence_corpus_file": EVIDENCE_CORPUS_PATH,
+
+    "num_stage3_rows": int(len(stage3_df)),
+    "num_rows_needing_verification": int(len(verify_df)),
+    "num_unique_subject_wikipedia_titles": int(len(unique_titles)),
+    "num_evidence_chunks": int(len(evidence_corpus)),
+    "num_retrieved_evidence_rows": int(len(retrieved_evidence_df)),
+
+    "embedding_model": EMBEDDING_MODEL_NAME,
+    "reranker_model": RERANKER_MODEL_NAME,
+    "retrieval_method": (
+        "PopQA subject Wikipedia page retrieval using BM25 + BGE dense retrieval "
+        "+ BGE reranker, followed by answer/relation grounding filters."
+    ),
+
+    "bm25_candidates": int(BM25_CANDIDATES),
+    "dense_candidates": int(DENSE_CANDIDATES),
+    "rerank_candidates": int(RERANK_CANDIDATES),
+    "top_evidence_per_claim": int(TOP_EVIDENCE_PER_CLAIM),
+
+    "row_index_policy": {
+        "row_index": "Original row index from the 500-row Stage 3 file.",
+        "verification_row_index": "Filtered verification-row index used only for audit/debugging."
+    },
+
+    "row_alignment_check": {
+        "id_mismatch_count": int(id_mismatch_count),
+        "question_mismatch_count": int(question_mismatch_count),
+        "row_index_min": int(retrieved_evidence_df["row_index"].min()),
+        "row_index_max": int(retrieved_evidence_df["row_index"].max()),
+        "unique_original_stage3_rows": int(retrieved_evidence_df["row_index"].nunique())
+    },
+
+    "retrieval_scope_counts": value_counts_dict(retrieved_evidence_df["retrieval_scope"]),
+    "evidence_strength_counts": value_counts_dict(retrieved_evidence_df["evidence_strength"]),
+    "answer_grounded_counts": value_counts_dict(retrieved_evidence_df["answer_grounded_in_evidence"]),
+    "relation_grounded_counts": value_counts_dict(retrieved_evidence_df["relation_grounded_in_evidence"]),
+
+    "stage3_answer_case_counts_in_verification_rows": value_counts_dict(verify_df["stage3_answer_case"]),
+    "kg_only_prediction_counts": value_counts_dict(stage3_df["kg_only_prediction"]),
+
+    "important_design_choices": {
+        "uses_wikipedia_only": True,
+        "uses_popqa_subject_wiki_title": True,
+        "does_not_search_broad_wikipedia_by_subject_label": True,
+        "manual_answer_alias_map_used": False,
+        "wikidata_aliases_used": False,
+        "popqa_possible_answers_used_for_grounding_only_when_model_answer_matches_reference": True,
+        "keeps_relation_only_evidence": True,
+        "why_keep_relation_only_evidence": (
+            "Relation-only chunks often contain the true relation value and are useful for NLI contradiction detection."
+        )
+    },
+
+    "label_definitions": {
+        "retrieval_scope": {
+            "subject_page_filtered": "Evidence was retrieved from the subject Wikipedia page and passed grounding filters.",
+            "no_filtered_evidence": "Subject page existed, but no candidate chunk passed grounding filters.",
+            "no_subject_page_evidence": "No usable subject Wikipedia page evidence was available."
+        },
+        "evidence_strength": {
+            "STRONG_ANSWER_AND_RELATION_MATCH": "Evidence mentions the answer and a relation clue.",
+            "ANSWER_ONLY_MATCH": "Evidence mentions the answer but not a relation clue.",
+            "RELATION_ONLY_MATCH": "Evidence mentions a relation clue but not the model answer. Useful for contradiction.",
+            "NO_EVIDENCE": "No acceptable evidence chunk was found."
+        }
+    }
+}
+
+with open(STAGE4_METADATA_PATH, "w") as f:
+    json.dump(metadata, f, indent=2)
+
+print("\nSaved Stage 4 metadata:", STAGE4_METADATA_PATH)
+
+print("\nStage 4 complete.")
