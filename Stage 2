@@ -1,1 +1,1098 @@
+# ============================================================
+# STAGE 2 FINAL REFINED:
+# Generate GenAI answers using Qwen2.5-3B-Instruct
+# and evaluate answers using PopQA possible_answers only.
+#
+# Input:
+# - data_final/stage1_questions_clean_with_kg_labels.csv
+#
+# Output:
+# - data_final/stage2_model_answers.csv
+# - data_final/stage2_model_answer_metadata.json
+# - data_final/stage2_popqa_alias_audit.csv
+#
+# Core design:
+# - Raw model answers are preserved.
+# - No manual alias dictionary.
+# - No Wikidata alias fetching.
+# - Matching uses only:
+#   1. main PopQA reference answer
+#   2. PopQA possible_answers
+# - Final labels use human-friendly names for paper readability.
+# ============================================================
 
+!pip install -q transformers accelerate bitsandbytes sentencepiece pandas numpy tqdm
+
+import os
+import re
+import ast
+import json
+import time
+import random
+import unicodedata
+import numpy as np
+import pandas as pd
+import torch
+
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+
+# ============================================================
+# 0. Configuration
+# ============================================================
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DATA_DIR = "data_final"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+STAGE1_PATH = f"{DATA_DIR}/stage1_questions_clean_with_kg_labels.csv"
+
+OUTPUT_PATH = f"{DATA_DIR}/stage2_model_answers.csv"
+METADATA_PATH = f"{DATA_DIR}/stage2_model_answer_metadata.json"
+ALIAS_AUDIT_PATH = f"{DATA_DIR}/stage2_popqa_alias_audit.csv"
+
+# If you want a larger run later, increase this.
+NUM_ROWS_FOR_STAGE2 = 500
+
+GENAI_MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+
+# If True, always generate new Qwen answers.
+# If False, code will reuse existing raw answers if available.
+FORCE_REGENERATE_MODEL_ANSWERS = False
+
+# If an older Stage 2 file exists, this allows reusing its raw answers.
+# This does not reuse old labels.
+POSSIBLE_OLD_STAGE2_FILES = [
+    f"{DATA_DIR}/stage2_model_answers.csv",
+    f"{DATA_DIR}/stage2_genai_answers_clean.csv"
+]
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+print("Device:", device)
+if device == "cuda":
+    print("GPU:", torch.cuda.get_device_name(0))
+else:
+    print("WARNING: No GPU detected. Qwen2.5-3B will be very slow on CPU.")
+    print("Recommended: Runtime -> Change runtime type -> T4 GPU")
+
+
+# ============================================================
+# 1. Human-friendly label constants
+# ============================================================
+
+KG_FACT_STATUS = {
+    "PRESENT": "FACT_PRESENT_IN_KG",
+    "MISSING": "FACT_MISSING_FROM_KG",
+    "UNKNOWN": "UNKNOWN_KG_STATUS"
+}
+
+ANSWER_CASE = {
+    "CORRECT_PRESENT": "CORRECT_AND_FACT_PRESENT_IN_KG",
+    "CORRECT_MISSING": "CORRECT_BUT_FACT_MISSING_FROM_KG",
+    "WRONG": "WRONG_MODEL_ANSWER",
+    "UNUSABLE": "UNUSABLE_MODEL_ANSWER"
+}
+
+ANSWER_MATCH_TYPE = {
+    "EXACT_REFERENCE": "EXACT_REFERENCE_ANSWER",
+    "POPQA_ALIAS": "POPQA_ALIAS",
+    "NO_MATCH": "NO_MATCH",
+    "INVALID": "INVALID_OUTPUT"
+}
+
+ANSWER_MATCH_SOURCE = {
+    "REFERENCE": "REFERENCE_ANSWER",
+    "POPQA": "POPQA_POSSIBLE_ANSWER",
+    "NO_MATCH": "NO_MATCH",
+    "INVALID": "INVALID_OUTPUT"
+}
+
+STAGE1_KG_LABEL_TO_NEW_STATUS = {
+    "KG_SUPPORTED": KG_FACT_STATUS["PRESENT"],
+    "MISSING_BUT_TRUE": KG_FACT_STATUS["MISSING"]
+}
+
+
+# ============================================================
+# 2. Load Stage 1
+# ============================================================
+
+if not os.path.exists(STAGE1_PATH):
+    raise FileNotFoundError(
+        f"Stage 1 file not found: {STAGE1_PATH}\n"
+        "Run Stage 1 first."
+    )
+
+stage1_df = pd.read_csv(STAGE1_PATH)
+
+print("\nLoaded Stage 1 rows:", len(stage1_df))
+print("Columns:", list(stage1_df.columns))
+
+required_cols = [
+    "id",
+    "question",
+    "subject_id",
+    "subject_label",
+    "relation_id",
+    "relation_label",
+    "relation_normalized",
+    "gold_object_id",
+    "gold_object_label",
+    "possible_answers",
+    "s_wiki_title",
+    "o_wiki_title",
+    "subject_popularity_bin",
+    "triple_id",
+    "gold_kg_label"
+]
+
+missing_cols = [c for c in required_cols if c not in stage1_df.columns]
+if missing_cols:
+    raise ValueError(f"Missing required Stage 1 columns: {missing_cols}")
+
+
+# Rename Stage 1 columns into reviewer-friendly Stage 2 names.
+questions_df = stage1_df.rename(columns={
+    "gold_object_id": "reference_answer_id",
+    "gold_object_label": "reference_answer",
+    "possible_answers": "popqa_possible_answers"
+}).copy()
+
+questions_df["kg_fact_status"] = (
+    questions_df["gold_kg_label"]
+    .map(STAGE1_KG_LABEL_TO_NEW_STATUS)
+    .fillna(KG_FACT_STATUS["UNKNOWN"])
+)
+
+# Remove old Stage 1 label from Stage 2 working data.
+questions_df = questions_df.drop(columns=["gold_kg_label"], errors="ignore")
+
+print("\nKG fact status distribution:")
+print(questions_df["kg_fact_status"].value_counts())
+
+print("\nRelation distribution:")
+print(questions_df["relation_normalized"].value_counts())
+
+print("\nPopularity distribution:")
+print(questions_df["subject_popularity_bin"].value_counts())
+
+
+# ============================================================
+# 3. Balanced Stage 2 sampling
+# ============================================================
+
+def balanced_sample(input_df, sample_size, seed=42):
+    """
+    Balanced across:
+    - KG fact status
+    - relation
+    - subject popularity bin
+    """
+    if sample_size is None or sample_size >= len(input_df):
+        return input_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+    df = input_df.copy()
+
+    df["sample_group"] = (
+        df["kg_fact_status"].astype(str) + "||" +
+        df["relation_normalized"].astype(str) + "||" +
+        df["subject_popularity_bin"].astype(str)
+    )
+
+    groups = list(df.groupby("sample_group"))
+    base_per_group = max(1, sample_size // len(groups))
+
+    sampled_parts = []
+
+    for _, group in groups:
+        n_take = min(base_per_group, len(group))
+        sampled_parts.append(group.sample(n=n_take, random_state=seed))
+
+    sample_df = pd.concat(sampled_parts).drop_duplicates(subset=["triple_id"])
+
+    if len(sample_df) < sample_size:
+        remaining = df[~df["triple_id"].isin(sample_df["triple_id"])]
+        needed = sample_size - len(sample_df)
+
+        if len(remaining) > 0:
+            topup = remaining.sample(
+                n=min(needed, len(remaining)),
+                random_state=seed
+            )
+            sample_df = pd.concat([sample_df, topup])
+
+    if len(sample_df) > sample_size:
+        sample_df = sample_df.sample(n=sample_size, random_state=seed)
+
+    sample_df = sample_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+    sample_df = sample_df.drop(columns=["sample_group"], errors="ignore")
+
+    return sample_df
+
+
+stage2_df = balanced_sample(
+    questions_df,
+    NUM_ROWS_FOR_STAGE2,
+    seed=SEED
+)
+
+print("\nStage 2 selected rows:", len(stage2_df))
+
+print("\nStage 2 KG fact status distribution:")
+print(stage2_df["kg_fact_status"].value_counts())
+
+print("\nStage 2 relation distribution:")
+print(stage2_df["relation_normalized"].value_counts())
+
+print("\nStage 2 popularity distribution:")
+print(stage2_df["subject_popularity_bin"].value_counts())
+
+
+# ============================================================
+# 4. Try reusing existing raw model answers
+# ============================================================
+
+stage2_df["model_raw_answer"] = np.nan
+
+if not FORCE_REGENERATE_MODEL_ANSWERS:
+    reused_file = None
+
+    for candidate_path in POSSIBLE_OLD_STAGE2_FILES:
+        if os.path.exists(candidate_path):
+            try:
+                old_df = pd.read_csv(candidate_path)
+
+                raw_col = None
+                if "model_raw_answer" in old_df.columns:
+                    raw_col = "model_raw_answer"
+                elif "genai_raw_answer" in old_df.columns:
+                    raw_col = "genai_raw_answer"
+
+                if raw_col is not None and "triple_id" in old_df.columns:
+                    raw_answers = (
+                        old_df[["triple_id", raw_col]]
+                        .dropna(subset=[raw_col])
+                        .drop_duplicates(subset=["triple_id"])
+                        .rename(columns={raw_col: "reused_model_raw_answer"})
+                    )
+
+                    before_missing = stage2_df["model_raw_answer"].isna().sum()
+
+                    stage2_df = stage2_df.merge(
+                        raw_answers,
+                        on="triple_id",
+                        how="left"
+                    )
+
+                    stage2_df["model_raw_answer"] = stage2_df["model_raw_answer"].fillna(
+                        stage2_df["reused_model_raw_answer"]
+                    )
+
+                    stage2_df = stage2_df.drop(columns=["reused_model_raw_answer"])
+
+                    after_missing = stage2_df["model_raw_answer"].isna().sum()
+
+                    if after_missing < before_missing:
+                        reused_file = candidate_path
+                        print(f"\nReused raw model answers from: {candidate_path}")
+                        print("Reused answers:", before_missing - after_missing)
+
+            except Exception as e:
+                print(f"Could not reuse answers from {candidate_path}: {e}")
+
+    if reused_file is None:
+        print("\nNo reusable raw model answers found. Will generate answers.")
+
+
+missing_answer_mask = (
+    stage2_df["model_raw_answer"].isna()
+    | (stage2_df["model_raw_answer"].astype(str).str.strip() == "")
+)
+
+num_missing_answers = int(missing_answer_mask.sum())
+
+print("\nRows needing model generation:", num_missing_answers)
+
+
+# ============================================================
+# 5. Generate Qwen answers if needed
+# ============================================================
+
+elapsed_seconds = 0.0
+batch_size_used = None
+num_generated_now = 0
+
+if num_missing_answers > 0:
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        GENAI_MODEL_NAME,
+        trust_remote_code=True
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    tokenizer.padding_side = "left"
+
+    if device == "cuda":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
+        )
+
+        model = AutoModelForCausalLM.from_pretrained(
+            GENAI_MODEL_NAME,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            GENAI_MODEL_NAME,
+            torch_dtype=torch.float32,
+            trust_remote_code=True
+        )
+        model.to(device)
+
+    model.eval()
+
+    print("\nLoaded GenAI model:", GENAI_MODEL_NAME)
+
+    def build_prompt(question):
+        return f"""Answer the question with only the shortest possible entity name.
+Do not explain.
+Do not write a full sentence.
+Do not include punctuation unless it is part of the name.
+
+Question: {question}
+Answer:"""
+
+    def generate_answers_batch(questions, batch_size=4, max_new_tokens=24):
+        all_answers = []
+
+        for start in tqdm(range(0, len(questions), batch_size)):
+            batch_questions = questions[start:start + batch_size]
+            prompts = [build_prompt(q) for q in batch_questions]
+
+            messages_batch = [
+                [{"role": "user", "content": prompt}]
+                for prompt in prompts
+            ]
+
+            texts = [
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                for messages in messages_batch
+            ]
+
+            inputs = tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512
+            ).to(model.device)
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id
+                )
+
+            generated_tokens = outputs[:, inputs["input_ids"].shape[1]:]
+            decoded = tokenizer.batch_decode(
+                generated_tokens,
+                skip_special_tokens=True
+            )
+
+            cleaned = [ans.strip() for ans in decoded]
+            all_answers.extend(cleaned)
+
+        return all_answers
+
+    batch_size_used = 4 if device == "cuda" else 1
+
+    missing_indices = stage2_df.index[missing_answer_mask].tolist()
+    missing_questions = stage2_df.loc[missing_indices, "question"].tolist()
+
+    start_time = time.time()
+
+    generated_answers = generate_answers_batch(
+        missing_questions,
+        batch_size=batch_size_used,
+        max_new_tokens=24
+    )
+
+    elapsed_seconds = time.time() - start_time
+    num_generated_now = len(generated_answers)
+
+    for idx, answer in zip(missing_indices, generated_answers):
+        stage2_df.at[idx, "model_raw_answer"] = answer
+
+    print("\nGenerated answers now:", num_generated_now)
+    print("Elapsed seconds:", round(elapsed_seconds, 2))
+
+else:
+    print("\nAll raw model answers were reused. No model generation needed.")
+
+
+# ============================================================
+# 6. Text normalization utilities
+# ============================================================
+
+def strip_accents(text):
+    text = str(text)
+    text = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in text if not unicodedata.combining(ch))
+
+
+def normalize_text(text):
+    """
+    Conservative normalization for answer matching.
+    No manual alias mapping is used.
+    """
+    if pd.isna(text):
+        return ""
+
+    text = str(text).strip()
+    text = strip_accents(text)
+    text = text.lower()
+
+    text = text.replace("_", " ")
+    text = text.replace("-", " ")
+
+    text = re.sub(r"[\“\”\‘\’\"']", "", text)
+    text = re.sub(r"\([^)]*\)", " ", text)
+
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def compact_text(text):
+    """
+    Compact form catches formatting differences:
+    - WashingtonDC vs Washington D C
+    - Qasr-e-Shirin vs Qasr e Shirin
+    """
+    return re.sub(r"[^a-z0-9]", "", normalize_text(text))
+
+
+def answer_forms(text):
+    """
+    Returns two answer forms:
+    1. normalized text with spaces
+    2. compact text without spaces
+    """
+    forms = set()
+
+    if pd.isna(text):
+        return forms
+
+    raw = str(text).strip()
+
+    if not raw:
+        return forms
+
+    norm = normalize_text(raw)
+    compact = compact_text(raw)
+
+    if norm:
+        forms.add(norm)
+
+    if compact:
+        forms.add(compact)
+
+    return forms
+
+
+# ============================================================
+# 7. Parse PopQA possible_answers
+# ============================================================
+
+def parse_popqa_possible_answers(value):
+    if isinstance(value, list):
+        return [str(x) for x in value if str(x).strip()]
+
+    if pd.isna(value):
+        return []
+
+    text = str(value).strip()
+
+    if not text:
+        return []
+
+    try:
+        parsed = ast.literal_eval(text)
+
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed if str(x).strip()]
+
+        if isinstance(parsed, tuple):
+            return [str(x) for x in parsed if str(x).strip()]
+
+        return [str(parsed)]
+
+    except Exception:
+        text = text.strip("[]")
+        parts = re.split(r",|\|", text)
+
+        return [
+            p.strip().strip("'").strip('"')
+            for p in parts
+            if p.strip()
+        ]
+
+
+# ============================================================
+# 8. Extract short entity answer from raw model output
+# ============================================================
+
+def extract_entity_answer(raw_answer, subject_label=None):
+    """
+    Extract a short entity-like answer from the raw model output.
+
+    Important:
+    - This does not manually correct the model.
+    - This does not remove hallucinated names.
+    - If the model gives a weird entity, we keep it as a wrong candidate.
+    """
+    if pd.isna(raw_answer):
+        return ""
+
+    text = str(raw_answer).strip()
+
+    # Keep first line only.
+    text = text.split("\n")[0].strip()
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" .;:")
+
+    if not text:
+        return ""
+
+    # Remove obvious answer prefixes.
+    text = re.sub(
+        r"^(answer:|the answer is|it is|it's|this is|that is)\s*",
+        "",
+        text,
+        flags=re.I
+    ).strip(" .;:")
+
+    # Empty/refusal-like answers are unusable.
+    if normalize_text(text) in {
+        "unknown",
+        "i dont know",
+        "i do not know",
+        "not sure",
+        "none",
+        "not available",
+        "cannot determine",
+        "cant determine",
+        "no answer"
+    }:
+        return ""
+
+    # If the model echoes the subject, keep it.
+    # Subject echo can be a model error.
+    if subject_label is not None:
+        if normalize_text(text) == normalize_text(subject_label):
+            return text
+
+    # If the model answered in a sentence, extract entity part.
+    extraction_patterns = [
+        r"(?:was|is|were|are)\s+written\s+by\s+(.+)$",
+        r"(?:was|is|were|are)\s+authored\s+by\s+(.+)$",
+        r"(?:was|is|were|are)\s+composed\s+by\s+(.+)$",
+        r"(?:was|is|were|are)\s+directed\s+by\s+(.+)$",
+        r"(?:was|is|were|are)\s+produced\s+by\s+(.+)$",
+        r"(?:was|is|were|are)\s+created\s+by\s+(.+)$",
+        r"(?:was|is|were|are)\s+published\s+by\s+(.+)$",
+        r"(?:was|is|were|are)\s+developed\s+by\s+(.+)$",
+        r"(?:the author|the writer|the screenwriter|the producer|the director|the composer|the capital)\s+(?:is|was)\s+(.+)$",
+        r"(?:author|writer|screenwriter|producer|director|composer|capital)\s+(?:is|was)\s+(.+)$",
+        r"(?:written by|authored by|composed by|directed by|produced by|created by|published by|developed by)\s+(.+)$",
+    ]
+
+    for pattern in extraction_patterns:
+        match = re.search(pattern, text, flags=re.I)
+
+        if match:
+            extracted = match.group(1).strip(" .;:")
+
+            if extracted:
+                text = extracted
+
+            break
+
+    # Remove explanation after answer.
+    text = re.split(
+        r"\s+(?:because|who|which|that|where|when|, and|\. )\s+",
+        text,
+        maxsplit=1,
+        flags=re.I
+    )[0]
+
+    text = text.strip(" .;:")
+
+    return text
+
+
+def is_usable_model_answer(answer):
+    """
+    Usable means the answer can be evaluated as an entity-like answer.
+    It does not mean correct.
+    """
+    if pd.isna(answer):
+        return False
+
+    answer = str(answer).strip()
+
+    if not answer:
+        return False
+
+    norm = normalize_text(answer)
+
+    if not norm:
+        return False
+
+    # Very long output probably means the model did not answer as an entity.
+    if len(answer.split()) > 12:
+        return False
+
+    bad_fragments = {
+        "the screenwriter",
+        "the author",
+        "the producer",
+        "the director",
+        "the composer",
+        "written by",
+        "authored by",
+        "produced by",
+        "directed by",
+    }
+
+    if norm in bad_fragments:
+        return False
+
+    return True
+
+
+stage2_df["model_extracted_answer"] = stage2_df.apply(
+    lambda row: extract_entity_answer(
+        row["model_raw_answer"],
+        subject_label=row["subject_label"]
+    ),
+    axis=1
+)
+
+stage2_df["is_model_answer_usable"] = stage2_df["model_extracted_answer"].apply(
+    is_usable_model_answer
+)
+
+stage2_df["model_normalized_answer"] = stage2_df["model_extracted_answer"].apply(
+    normalize_text
+)
+
+
+# ============================================================
+# 9. Build reference answer set using reference_answer + PopQA aliases
+# ============================================================
+
+def build_reference_answer_entries(row):
+    """
+    Reference answer entries used for matching.
+
+    Sources:
+    - REFERENCE_ANSWER: main answer from PopQA object label
+    - POPQA_POSSIBLE_ANSWER: PopQA possible_answers
+
+    No manual aliases.
+    No Wikidata aliases.
+    """
+    entries = []
+
+    reference_answer = str(row.get("reference_answer", "")).strip()
+
+    if reference_answer and reference_answer.lower() != "nan":
+        entries.append({
+            "answer": reference_answer,
+            "source": ANSWER_MATCH_SOURCE["REFERENCE"]
+        })
+
+    for alias in parse_popqa_possible_answers(row.get("popqa_possible_answers", "")):
+        alias = str(alias).strip()
+
+        if alias and alias.lower() != "nan":
+            entries.append({
+                "answer": alias,
+                "source": ANSWER_MATCH_SOURCE["POPQA"]
+            })
+
+    # Deduplicate.
+    seen = set()
+    clean_entries = []
+
+    for entry in entries:
+        answer = entry["answer"]
+        source = entry["source"]
+
+        forms = answer_forms(answer)
+
+        if not forms:
+            continue
+
+        key = (normalize_text(answer), compact_text(answer), source)
+
+        if key not in seen:
+            seen.add(key)
+            clean_entries.append(entry)
+
+    return clean_entries
+
+
+def build_reference_form_map(reference_entries):
+    """
+    Maps normalized answer forms to source.
+
+    Priority:
+    1. REFERENCE_ANSWER
+    2. POPQA_POSSIBLE_ANSWER
+    """
+    source_priority = {
+        ANSWER_MATCH_SOURCE["REFERENCE"]: 1,
+        ANSWER_MATCH_SOURCE["POPQA"]: 2
+    }
+
+    form_map = {}
+
+    for entry in reference_entries:
+        answer = entry["answer"]
+        source = entry["source"]
+
+        for form in answer_forms(answer):
+            if not form:
+                continue
+
+            if form not in form_map:
+                form_map[form] = {
+                    "answer": answer,
+                    "source": source
+                }
+            else:
+                old_source = form_map[form]["source"]
+
+                if source_priority[source] < source_priority[old_source]:
+                    form_map[form] = {
+                        "answer": answer,
+                        "source": source
+                    }
+
+    return form_map
+
+
+reference_entries_list = []
+reference_form_map_list = []
+
+for _, row in stage2_df.iterrows():
+    entries = build_reference_answer_entries(row)
+    form_map = build_reference_form_map(entries)
+
+    reference_entries_list.append(entries)
+    reference_form_map_list.append(form_map)
+
+stage2_df["reference_answer_entries"] = [
+    json.dumps(x, ensure_ascii=False)
+    for x in reference_entries_list
+]
+
+stage2_df["num_reference_answer_forms"] = [
+    len(x)
+    for x in reference_entries_list
+]
+
+
+# ============================================================
+# 10. Match model answer to reference answer set
+# ============================================================
+
+def match_model_answer(row, reference_form_map):
+    if not row["is_model_answer_usable"]:
+        return {
+            "model_answer_matches_reference": False,
+            "matched_reference_answer": None,
+            "answer_match_type": ANSWER_MATCH_TYPE["INVALID"],
+            "answer_match_source": ANSWER_MATCH_SOURCE["INVALID"]
+        }
+
+    model_answer = row["model_extracted_answer"]
+    model_forms = answer_forms(model_answer)
+
+    for form in model_forms:
+        if form in reference_form_map:
+            matched = reference_form_map[form]
+            source = matched["source"]
+
+            if source == ANSWER_MATCH_SOURCE["REFERENCE"]:
+                match_type = ANSWER_MATCH_TYPE["EXACT_REFERENCE"]
+            elif source == ANSWER_MATCH_SOURCE["POPQA"]:
+                match_type = ANSWER_MATCH_TYPE["POPQA_ALIAS"]
+            else:
+                match_type = source
+
+            return {
+                "model_answer_matches_reference": True,
+                "matched_reference_answer": matched["answer"],
+                "answer_match_type": match_type,
+                "answer_match_source": source
+            }
+
+    return {
+        "model_answer_matches_reference": False,
+        "matched_reference_answer": None,
+        "answer_match_type": ANSWER_MATCH_TYPE["NO_MATCH"],
+        "answer_match_source": ANSWER_MATCH_SOURCE["NO_MATCH"]
+    }
+
+
+match_results = []
+
+for idx, row in stage2_df.iterrows():
+    result = match_model_answer(row, reference_form_map_list[idx])
+    match_results.append(result)
+
+match_df = pd.DataFrame(match_results)
+
+for col in match_df.columns:
+    stage2_df[col] = match_df[col]
+
+
+# ============================================================
+# 11. Assign final human-friendly answer case
+# ============================================================
+
+def assign_answer_case(row):
+    """
+    Final Stage 2 evaluation label.
+
+    These labels are for evaluation only.
+    They are not given to the hallucination detector.
+    """
+    if not row["is_model_answer_usable"]:
+        return ANSWER_CASE["UNUSABLE"]
+
+    if row["model_answer_matches_reference"]:
+        if row["kg_fact_status"] == KG_FACT_STATUS["PRESENT"]:
+            return ANSWER_CASE["CORRECT_PRESENT"]
+
+        if row["kg_fact_status"] == KG_FACT_STATUS["MISSING"]:
+            return ANSWER_CASE["CORRECT_MISSING"]
+
+    return ANSWER_CASE["WRONG"]
+
+
+stage2_df["answer_case"] = stage2_df.apply(assign_answer_case, axis=1)
+
+stage2_df["is_exact_reference_match"] = (
+    stage2_df["answer_match_source"] == ANSWER_MATCH_SOURCE["REFERENCE"]
+)
+
+stage2_df["is_popqa_alias_match"] = (
+    stage2_df["answer_match_source"] == ANSWER_MATCH_SOURCE["POPQA"]
+)
+
+
+# ============================================================
+# 12. Diagnostics
+# ============================================================
+
+print("\nFinal Stage 2 answer case distribution:")
+print(stage2_df["answer_case"].value_counts())
+
+print("\nReference match rate:")
+print(round(float(stage2_df["model_answer_matches_reference"].mean()), 4))
+
+print("\nAnswer match type distribution:")
+print(stage2_df["answer_match_type"].value_counts())
+
+print("\nAnswer match source distribution:")
+print(stage2_df["answer_match_source"].value_counts())
+
+print("\nPopQA alias match counts:")
+print(stage2_df["is_popqa_alias_match"].value_counts())
+
+relation_summary = (
+    stage2_df
+    .groupby("relation_normalized")
+    .agg(
+        num_rows=("question", "count"),
+        correct_answers=("model_answer_matches_reference", lambda x: int((x == True).sum())),
+        correct_and_fact_present_in_kg=("answer_case", lambda x: int((x == ANSWER_CASE["CORRECT_PRESENT"]).sum())),
+        correct_but_fact_missing_from_kg=("answer_case", lambda x: int((x == ANSWER_CASE["CORRECT_MISSING"]).sum())),
+        wrong_model_answers=("answer_case", lambda x: int((x == ANSWER_CASE["WRONG"]).sum())),
+        unusable_model_answers=("answer_case", lambda x: int((x == ANSWER_CASE["UNUSABLE"]).sum())),
+        exact_reference_matches=("is_exact_reference_match", lambda x: int((x == True).sum())),
+        popqa_alias_matches=("is_popqa_alias_match", lambda x: int((x == True).sum())),
+    )
+    .reset_index()
+)
+
+print("\nRelation-level Stage 2 summary:")
+display(relation_summary.sort_values("correct_answers", ascending=False))
+
+print("\nStage 2 preview:")
+display(stage2_df[[
+    "question",
+    "subject_label",
+    "relation_normalized",
+    "reference_answer",
+    "popqa_possible_answers",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "is_model_answer_usable",
+    "model_answer_matches_reference",
+    "matched_reference_answer",
+    "answer_match_type",
+    "answer_match_source",
+    "kg_fact_status",
+    "answer_case",
+    "subject_popularity_bin"
+]].head(50))
+
+
+# ============================================================
+# 13. Save PopQA alias audit
+# ============================================================
+
+alias_audit_df = stage2_df[
+    stage2_df["is_popqa_alias_match"] == True
+][[
+    "question",
+    "subject_label",
+    "relation_normalized",
+    "reference_answer",
+    "popqa_possible_answers",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "matched_reference_answer",
+    "answer_match_type",
+    "answer_match_source",
+    "kg_fact_status",
+    "answer_case",
+    "subject_popularity_bin"
+]].copy()
+
+alias_audit_df.to_csv(ALIAS_AUDIT_PATH, index=False)
+
+print("\nSaved PopQA alias audit:", ALIAS_AUDIT_PATH)
+print("PopQA alias audit rows:", len(alias_audit_df))
+
+display(alias_audit_df.head(50))
+
+
+# ============================================================
+# 14. Save final Stage 2 output
+# ============================================================
+
+# Remove old-style labels if they came from any reused file.
+old_label_columns_to_remove = [
+    "gold_kg_label",
+    "genai_case",
+    "genai_matches_gold",
+    "match_type",
+    "match_source",
+    "best_gold_match",
+    "llm_raw_answer",
+    "llm_clean_answer",
+    "llm_extracted_answer"
+]
+
+stage2_df = stage2_df.drop(columns=old_label_columns_to_remove, errors="ignore")
+
+stage2_df.to_csv(OUTPUT_PATH, index=False)
+
+metadata = {
+    "stage": "Stage 2 Final Model Answer Generation and PopQA Alias Evaluation",
+    "input_file": STAGE1_PATH,
+    "output_file": OUTPUT_PATH,
+    "alias_audit_file": ALIAS_AUDIT_PATH,
+    "model_name": GENAI_MODEL_NAME,
+    "device": device,
+    "num_rows_requested": int(NUM_ROWS_FOR_STAGE2),
+    "num_rows_in_stage2": int(len(stage2_df)),
+    "num_generated_now": int(num_generated_now),
+    "force_regenerate_model_answers": bool(FORCE_REGENERATE_MODEL_ANSWERS),
+    "batch_size_used": None if batch_size_used is None else int(batch_size_used),
+    "elapsed_seconds_for_generation": float(elapsed_seconds),
+    "alias_policy": {
+        "manual_alias_map_used": False,
+        "wikidata_aliases_used": False,
+        "popqa_possible_answers_used": True,
+        "main_reference_answer_used": True
+    },
+    "label_policy": {
+        "old_technical_labels_removed": True,
+        "human_friendly_labels_used": True
+    },
+    "kg_fact_status_distribution": stage2_df["kg_fact_status"].value_counts().to_dict(),
+    "answer_case_distribution": stage2_df["answer_case"].value_counts().to_dict(),
+    "answer_match_type_distribution": stage2_df["answer_match_type"].value_counts().to_dict(),
+    "answer_match_source_distribution": stage2_df["answer_match_source"].value_counts().to_dict(),
+    "reference_match_rate": float(stage2_df["model_answer_matches_reference"].mean()),
+    "relation_distribution": stage2_df["relation_normalized"].value_counts().to_dict(),
+    "subject_popularity_distribution": stage2_df["subject_popularity_bin"].value_counts().astype(int).to_dict(),
+    "relation_summary": relation_summary.to_dict(orient="records"),
+    "label_definitions": {
+        "kg_fact_status": {
+            KG_FACT_STATUS["PRESENT"]: "The true reference fact exists in the incomplete KG.",
+            KG_FACT_STATUS["MISSING"]: "The true reference fact was removed from the incomplete KG."
+        },
+        "answer_case": {
+            ANSWER_CASE["CORRECT_PRESENT"]: "The model answered correctly and the fact is present in the incomplete KG.",
+            ANSWER_CASE["CORRECT_MISSING"]: "The model answered correctly but the fact is missing from the incomplete KG.",
+            ANSWER_CASE["WRONG"]: "The model answer does not match the reference answer or PopQA aliases.",
+            ANSWER_CASE["UNUSABLE"]: "The model output is not usable as a short entity answer."
+        },
+        "answer_match_type": {
+            ANSWER_MATCH_TYPE["EXACT_REFERENCE"]: "The model answer exactly matched the main reference answer.",
+            ANSWER_MATCH_TYPE["POPQA_ALIAS"]: "The model answer matched one of PopQA's possible_answers.",
+            ANSWER_MATCH_TYPE["NO_MATCH"]: "The model answer did not match the reference answer or PopQA aliases.",
+            ANSWER_MATCH_TYPE["INVALID"]: "The model output could not be evaluated."
+        }
+    },
+    "notes": {
+        "stage_objective": (
+            "Stage 2 obtains real model answers and labels them against PopQA references. "
+            "The labels are used only for evaluation, not as input to later detectors."
+        ),
+        "why_popqa_aliases": (
+            "PopQA possible_answers are dataset-provided and reproducible, making them safer "
+            "than manual or live external aliases for primary evaluation."
+        )
+    }
+}
+
+with open(METADATA_PATH, "w") as f:
+    json.dump(metadata, f, indent=2)
+
+print("\nSaved Stage 2 output:", OUTPUT_PATH)
+print("Saved Stage 2 metadata:", METADATA_PATH)
+
+print("\nMetadata:")
+print(json.dumps(metadata, indent=2))
