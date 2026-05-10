@@ -1,0 +1,468 @@
+# ============================================================
+# STAGE 3 FINAL:
+# KG-only hallucination baseline on Stage 2 model answers
+#
+# Input:
+# - data_final/stage2_model_answers.csv
+# - data_final/kg_incomplete_clean.csv
+#
+# Output:
+# - data_final/stage3_kg_only_predictions.csv
+# - data_final/stage3_kg_only_metrics.json
+# ============================================================
+
+!pip install -q pandas numpy scikit-learn
+
+import os
+import json
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+# ============================================================
+# 0. Config
+# ============================================================
+
+DATA_DIR = "data_final"
+
+STAGE2_PATH = f"{DATA_DIR}/stage2_model_answers.csv"
+KG_INCOMPLETE_PATH = f"{DATA_DIR}/kg_incomplete_clean.csv"
+
+STAGE3_OUTPUT_PATH = f"{DATA_DIR}/stage3_kg_only_predictions.csv"
+STAGE3_METRICS_PATH = f"{DATA_DIR}/stage3_kg_only_metrics.json"
+
+assert os.path.exists(STAGE2_PATH), f"Stage 2 output not found: {STAGE2_PATH}"
+assert os.path.exists(KG_INCOMPLETE_PATH), f"Incomplete KG file not found: {KG_INCOMPLETE_PATH}"
+
+
+# ============================================================
+# 1. Load inputs
+# ============================================================
+
+stage2_df = pd.read_csv(STAGE2_PATH)
+kg_incomplete = pd.read_csv(KG_INCOMPLETE_PATH)
+
+print("Stage 2 rows:", len(stage2_df))
+print("Incomplete KG triples:", len(kg_incomplete))
+
+required_stage2_cols = [
+    "triple_id",
+    "question",
+    "subject_label",
+    "relation_normalized",
+    "reference_answer",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "is_model_answer_usable",
+    "model_answer_matches_reference",
+    "kg_fact_status",
+    "answer_case",
+    "subject_popularity_bin"
+]
+
+missing_cols = [c for c in required_stage2_cols if c not in stage2_df.columns]
+if missing_cols:
+    raise ValueError(f"Missing expected Stage 2 columns: {missing_cols}")
+
+if "triple_id" not in kg_incomplete.columns:
+    raise ValueError("kg_incomplete_clean.csv must contain a triple_id column.")
+
+print("\nStage 2 answer case distribution:")
+print(stage2_df["answer_case"].value_counts())
+
+print("\nStage 2 KG fact status distribution:")
+print(stage2_df["kg_fact_status"].value_counts())
+
+kg_triple_set = set(kg_incomplete["triple_id"].astype(str))
+
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+def to_bool(value):
+    """
+    Converts booleans safely when CSV reload turns True/False into strings.
+    """
+    if isinstance(value, bool):
+        return value
+
+    if pd.isna(value):
+        return False
+
+    value = str(value).strip().lower()
+
+    if value in {"true", "1", "yes", "y"}:
+        return True
+
+    return False
+
+
+def kg_status_from_triple(row):
+    """
+    Recompute whether the true reference fact is present in the incomplete KG.
+    This avoids relying only on the Stage 2 saved label.
+    """
+    triple_id = str(row["triple_id"])
+
+    if triple_id in kg_triple_set:
+        return "FACT_PRESENT_IN_KG"
+
+    return "FACT_MISSING_FROM_KG"
+
+
+def assign_stage3_answer_case(row):
+    """
+    Human-readable analysis case for Stage 3.
+    This mirrors Stage 2 logic, but recomputes it from current columns.
+    """
+
+    usable = to_bool(row["is_model_answer_usable"])
+    matches_reference = to_bool(row["model_answer_matches_reference"])
+    kg_status = row["kg_fact_status_checked"]
+
+    if not usable:
+        return "UNUSABLE_MODEL_ANSWER"
+
+    if matches_reference and kg_status == "FACT_PRESENT_IN_KG":
+        return "CORRECT_AND_FACT_PRESENT_IN_KG"
+
+    if matches_reference and kg_status == "FACT_MISSING_FROM_KG":
+        return "CORRECT_BUT_FACT_MISSING_FROM_KG"
+
+    return "WRONG_MODEL_ANSWER"
+
+
+def kg_only_predict(row):
+    """
+    KG-only baseline.
+
+    Core idea:
+    - If model output is unusable, mark it unusable.
+    - If model answer is correct AND the fact exists in the incomplete KG,
+      KG-only marks it as supported.
+    - Otherwise, KG-only flags it as hallucination.
+
+    This intentionally exposes the weakness of KG-only detection:
+    a correct answer is still flagged if the KG is incomplete.
+    """
+
+    if row["stage3_answer_case"] == "UNUSABLE_MODEL_ANSWER":
+        return "UNUSABLE_MODEL_ANSWER"
+
+    if (
+        to_bool(row["model_answer_matches_reference"])
+        and row["kg_fact_status_checked"] == "FACT_PRESENT_IN_KG"
+    ):
+        return "SUPPORTED_BY_KG_ONLY"
+
+    return "FLAGGED_AS_HALLUCINATION_BY_KG_ONLY"
+
+
+# ============================================================
+# 3. Recheck KG status and run KG-only prediction
+# ============================================================
+
+stage3_df = stage2_df.copy()
+
+stage3_df["kg_fact_status_checked"] = stage3_df.apply(
+    kg_status_from_triple,
+    axis=1
+)
+
+status_mismatches = stage3_df[
+    stage3_df["kg_fact_status"].astype(str) != stage3_df["kg_fact_status_checked"].astype(str)
+].copy()
+
+print("\nKG status mismatches between Stage 2 and recomputed KG:")
+print(len(status_mismatches))
+
+if len(status_mismatches) > 0:
+    print("Warning: Some Stage 2 kg_fact_status values do not match kg_incomplete_clean.csv.")
+    display(status_mismatches[[
+        "question",
+        "triple_id",
+        "kg_fact_status",
+        "kg_fact_status_checked"
+    ]].head(20))
+
+stage3_df["stage3_answer_case"] = stage3_df.apply(
+    assign_stage3_answer_case,
+    axis=1
+)
+
+stage3_df["kg_only_prediction"] = stage3_df.apply(
+    kg_only_predict,
+    axis=1
+)
+
+print("\nStage 3 answer case distribution:")
+print(stage3_df["stage3_answer_case"].value_counts())
+
+print("\nKG-only prediction distribution:")
+print(stage3_df["kg_only_prediction"].value_counts())
+
+
+# ============================================================
+# 4. Binary evaluation
+# ============================================================
+
+eval_df = stage3_df[
+    stage3_df["stage3_answer_case"] != "UNUSABLE_MODEL_ANSWER"
+].copy()
+
+eval_df["reference_binary_label"] = np.where(
+    eval_df["model_answer_matches_reference"].apply(to_bool),
+    "NOT_HALLUCINATION",
+    "HALLUCINATION"
+)
+
+eval_df["kg_only_binary_prediction"] = np.where(
+    eval_df["kg_only_prediction"] == "SUPPORTED_BY_KG_ONLY",
+    "NOT_HALLUCINATION",
+    "HALLUCINATION"
+)
+
+labels = ["NOT_HALLUCINATION", "HALLUCINATION"]
+
+accuracy = accuracy_score(
+    eval_df["reference_binary_label"],
+    eval_df["kg_only_binary_prediction"]
+)
+
+true_not_hallucination = eval_df["reference_binary_label"] == "NOT_HALLUCINATION"
+predicted_hallucination = eval_df["kg_only_binary_prediction"] == "HALLUCINATION"
+
+false_hallucinations = eval_df[
+    true_not_hallucination & predicted_hallucination
+].copy()
+
+false_hallucination_rate = (
+    len(false_hallucinations) / int(true_not_hallucination.sum())
+    if int(true_not_hallucination.sum()) > 0
+    else 0.0
+)
+
+correct_but_missing = eval_df[
+    eval_df["stage3_answer_case"] == "CORRECT_BUT_FACT_MISSING_FROM_KG"
+].copy()
+
+print("\n================ KG-ONLY BASELINE METRICS ================")
+print("Evaluated rows:", len(eval_df))
+print("Accuracy:", round(accuracy, 4))
+
+print("\nCorrect model answers:", int(true_not_hallucination.sum()))
+print("False hallucinations by KG-only:", len(false_hallucinations))
+print("False hallucination rate:", round(false_hallucination_rate, 4))
+
+print("\nCorrect-but-fact-missing cases:", len(correct_but_missing))
+print("KG-only predictions on correct-but-fact-missing:")
+print(correct_but_missing["kg_only_prediction"].value_counts())
+
+print("\nClassification report:")
+print(classification_report(
+    eval_df["reference_binary_label"],
+    eval_df["kg_only_binary_prediction"],
+    labels=labels,
+    zero_division=0
+))
+
+print("\nConfusion matrix:")
+cm = confusion_matrix(
+    eval_df["reference_binary_label"],
+    eval_df["kg_only_binary_prediction"],
+    labels=labels
+)
+
+display(pd.DataFrame(
+    cm,
+    index=[f"true_{x}" for x in labels],
+    columns=[f"pred_{x}" for x in labels]
+))
+
+
+# ============================================================
+# 5. Breakdown by relation
+# ============================================================
+
+relation_breakdown_rows = []
+
+for relation, group in eval_df.groupby("relation_normalized"):
+    true_correct = group["reference_binary_label"] == "NOT_HALLUCINATION"
+    false_hall = group[
+        true_correct & (group["kg_only_binary_prediction"] == "HALLUCINATION")
+    ]
+
+    relation_breakdown_rows.append({
+        "relation": relation,
+        "num_rows": int(len(group)),
+        "correct_model_answers": int(true_correct.sum()),
+        "kg_only_false_hallucinations": int(len(false_hall)),
+        "kg_only_false_hallucination_rate": float(
+            len(false_hall) / true_correct.sum()
+            if true_correct.sum() > 0
+            else 0.0
+        ),
+        "correct_but_fact_missing_cases": int(
+            (group["stage3_answer_case"] == "CORRECT_BUT_FACT_MISSING_FROM_KG").sum()
+        )
+    })
+
+relation_breakdown = pd.DataFrame(relation_breakdown_rows).sort_values(
+    "kg_only_false_hallucination_rate",
+    ascending=False
+)
+
+print("\nFalse hallucination breakdown by relation:")
+display(relation_breakdown)
+
+
+# ============================================================
+# 6. Breakdown by subject popularity
+# ============================================================
+
+popularity_breakdown_rows = []
+
+for pop_bin, group in eval_df.groupby("subject_popularity_bin"):
+    true_correct = group["reference_binary_label"] == "NOT_HALLUCINATION"
+    false_hall = group[
+        true_correct & (group["kg_only_binary_prediction"] == "HALLUCINATION")
+    ]
+
+    popularity_breakdown_rows.append({
+        "subject_popularity_bin": pop_bin,
+        "num_rows": int(len(group)),
+        "correct_model_answers": int(true_correct.sum()),
+        "kg_only_false_hallucinations": int(len(false_hall)),
+        "kg_only_false_hallucination_rate": float(
+            len(false_hall) / true_correct.sum()
+            if true_correct.sum() > 0
+            else 0.0
+        ),
+        "correct_but_fact_missing_cases": int(
+            (group["stage3_answer_case"] == "CORRECT_BUT_FACT_MISSING_FROM_KG").sum()
+        )
+    })
+
+popularity_breakdown = pd.DataFrame(popularity_breakdown_rows).sort_values(
+    "kg_only_false_hallucination_rate",
+    ascending=False
+)
+
+print("\nFalse hallucination breakdown by subject popularity:")
+display(popularity_breakdown)
+
+
+# ============================================================
+# 7. Important failure examples
+# ============================================================
+
+print("\nExamples where KG-only falsely marks correct model answers as hallucinations:")
+
+example_cols = [
+    "question",
+    "subject_label",
+    "relation_label",
+    "relation_normalized",
+    "reference_answer",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "kg_fact_status_checked",
+    "stage3_answer_case",
+    "kg_only_prediction",
+    "subject_popularity_bin"
+]
+
+example_cols = [c for c in example_cols if c in false_hallucinations.columns]
+
+display(false_hallucinations[example_cols].head(30))
+
+
+# ============================================================
+# 8. Save outputs
+# ============================================================
+
+stage3_df.to_csv(STAGE3_OUTPUT_PATH, index=False)
+
+metrics = {
+    "stage": "Stage 3 Final KG-only Baseline",
+    "input_stage2_file": STAGE2_PATH,
+    "input_incomplete_kg_file": KG_INCOMPLETE_PATH,
+    "output_file": STAGE3_OUTPUT_PATH,
+
+    "num_total_rows": int(len(stage3_df)),
+    "num_evaluated_rows": int(len(eval_df)),
+    "kg_size_incomplete": int(len(kg_incomplete)),
+
+    "accuracy": float(accuracy),
+
+    "correct_model_answers": int(true_not_hallucination.sum()),
+    "false_hallucination_count": int(len(false_hallucinations)),
+    "false_hallucination_rate": float(false_hallucination_rate),
+    "correct_but_fact_missing_cases": int(len(correct_but_missing)),
+
+    "stage2_answer_case_distribution": stage2_df["answer_case"].value_counts().to_dict(),
+    "stage3_answer_case_distribution": stage3_df["stage3_answer_case"].value_counts().to_dict(),
+    "kg_fact_status_distribution": stage3_df["kg_fact_status_checked"].value_counts().to_dict(),
+    "kg_only_prediction_distribution": stage3_df["kg_only_prediction"].value_counts().to_dict(),
+
+    "kg_status_mismatch_count": int(len(status_mismatches)),
+
+    "relation_breakdown": relation_breakdown.to_dict(orient="records"),
+    "subject_popularity_breakdown": popularity_breakdown.to_dict(orient="records"),
+
+    "classification_report": classification_report(
+        eval_df["reference_binary_label"],
+        eval_df["kg_only_binary_prediction"],
+        labels=labels,
+        zero_division=0,
+        output_dict=True
+    ),
+
+    "confusion_matrix_labels": labels,
+    "confusion_matrix": cm.tolist(),
+
+    "label_definitions": {
+        "stage3_answer_case": {
+            "CORRECT_AND_FACT_PRESENT_IN_KG": "The model answer is correct and the reference fact exists in the incomplete KG.",
+            "CORRECT_BUT_FACT_MISSING_FROM_KG": "The model answer is correct but the reference fact was removed from the incomplete KG.",
+            "WRONG_MODEL_ANSWER": "The model answer does not match the reference answer or PopQA aliases.",
+            "UNUSABLE_MODEL_ANSWER": "The model output is not usable as a short entity answer."
+        },
+        "kg_only_prediction": {
+            "SUPPORTED_BY_KG_ONLY": "The KG-only baseline marks the answer as supported because the correct reference triple exists in the incomplete KG.",
+            "FLAGGED_AS_HALLUCINATION_BY_KG_ONLY": "The KG-only baseline marks the answer as hallucination because the fact is missing from the incomplete KG or the model answer is wrong.",
+            "UNUSABLE_MODEL_ANSWER": "The model output was not evaluated because it is unusable."
+        },
+        "reference_binary_label": {
+            "NOT_HALLUCINATION": "The model answer matches the PopQA reference answer or PopQA aliases.",
+            "HALLUCINATION": "The model answer does not match the PopQA reference answer or PopQA aliases."
+        }
+    },
+
+    "notes": {
+        "core_baseline_logic": "KG-only detection treats an answer as supported only when the model answer is correct and the reference triple is present in the incomplete KG.",
+        "known_limitation": "This baseline intentionally exposes KG incompleteness: correct answers whose facts were removed from the KG are falsely flagged as hallucinations.",
+        "no_old_stage2_labels_used": True,
+        "old_labels_removed": [
+            "genai_case",
+            "gold_kg_label",
+            "KG_SUPPORTED",
+            "KG_ONLY_HALLUCINATED",
+            "INVALID_GENAI_ANSWER"
+        ]
+    }
+}
+
+with open(STAGE3_METRICS_PATH, "w") as f:
+    json.dump(metrics, f, indent=2)
+
+print("\nSaved Stage 3 predictions:", STAGE3_OUTPUT_PATH)
+print("Saved Stage 3 metrics:", STAGE3_METRICS_PATH)
+
+print("Key metrics:")
+print("Accuracy:", round(accuracy, 4))
+print("False hallucination count:", len(false_hallucinations))
+print("False hallucination rate:", round(false_hallucination_rate, 4))
+print("Correct-but-fact-missing cases:", len(correct_but_missing))
