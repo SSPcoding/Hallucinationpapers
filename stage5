@@ -1,0 +1,1128 @@
+# ============================================================
+# STAGE 5 FINAL:
+# NLI evidence verification + safer hybrid hallucination detector
+#
+# Inputs:
+# - data_final/stage3_kg_only_predictions.csv
+# - data_final/stage4_claims_with_evidence.csv
+#
+# Outputs:
+# - data_final/stage5_nli_evidence_predictions.csv
+# - data_final/stage5_hybrid_predictions.csv
+# - data_final/stage5_hybrid_metrics.json
+# ============================================================
+
+!pip install -q transformers accelerate sentencepiece pandas numpy tqdm scikit-learn
+
+import os
+import json
+import gc
+import numpy as np
+import pandas as pd
+import torch
+
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+# ============================================================
+# 0. Free Stage 4 model memory if still loaded
+# ============================================================
+
+for var_name in [
+    "embedding_model",
+    "reranker_model",
+    "corpus_embeddings",
+    "evidence_corpus",
+    "corpus_texts",
+    "bm25_index"
+]:
+    try:
+        del globals()[var_name]
+    except Exception:
+        pass
+
+gc.collect()
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+
+# ============================================================
+# 1. Config
+# ============================================================
+
+DATA_DIR = "data_final"
+
+STAGE3_CANDIDATES = [
+    f"{DATA_DIR}/stage3_kg_only_predictions.csv",
+    f"{DATA_DIR}/stage3_kg_only_genai_predictions.csv"
+]
+
+STAGE4_CANDIDATES = [
+    f"{DATA_DIR}/stage4_claims_with_evidence.csv",
+    f"{DATA_DIR}/stage4_genai_claims_with_evidence.csv"
+]
+
+STAGE5_EVIDENCE_OUTPUT = f"{DATA_DIR}/stage5_nli_evidence_predictions.csv"
+STAGE5_FINAL_OUTPUT = f"{DATA_DIR}/stage5_hybrid_predictions.csv"
+STAGE5_METRICS_OUTPUT = f"{DATA_DIR}/stage5_hybrid_metrics.json"
+
+NLI_MODEL_NAME = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
+
+# Centralized labels
+KG_ONLY_SUPPORTED = "SUPPORTED_BY_KG_ONLY"
+KG_ONLY_FLAGGED = "FLAGGED_AS_HALLUCINATION_BY_KG_ONLY"
+UNUSABLE_MODEL_ANSWER = "UNUSABLE_MODEL_ANSWER"
+
+ANSWER_CORRECT_PRESENT = "CORRECT_AND_FACT_PRESENT_IN_KG"
+ANSWER_CORRECT_MISSING = "CORRECT_BUT_FACT_MISSING_FROM_KG"
+ANSWER_WRONG = "WRONG_MODEL_ANSWER"
+
+FACT_PRESENT = "FACT_PRESENT_IN_KG"
+FACT_MISSING = "FACT_MISSING_FROM_KG"
+
+EVIDENCE_SUPPORTED = "SUPPORTED_BY_EVIDENCE"
+EVIDENCE_CONTRADICTED = "CONTRADICTED_BY_EVIDENCE"
+EVIDENCE_NOT_ENOUGH = "NOT_ENOUGH_EVIDENCE"
+
+HYBRID_SUPPORTED_BY_KG = "SUPPORTED_BY_KG"
+HYBRID_VERIFIED_BY_TEXT = "VERIFIED_BY_TEXT_EVIDENCE"
+HYBRID_CONTRADICTED_BY_TEXT = "CONTRADICTED_BY_TEXT_EVIDENCE"
+HYBRID_NOT_ENOUGH = "NOT_ENOUGH_EVIDENCE"
+
+NOT_HALLUCINATION = "NOT_HALLUCINATION"
+HALLUCINATION = "HALLUCINATION"
+
+# Conservative NLI thresholds
+THRESHOLDS = {
+    "support_entailment_min": 0.85,
+    "support_contradiction_max": 0.20,
+    "contradiction_min": 0.75,
+    "contradiction_entailment_max": 0.25,
+    "support_margin": 0.15,
+    "contradiction_margin": 0.10,
+    "strict_contradiction_min": 0.90
+}
+
+# Evidence-strength policy from Stage 4
+SUPPORT_ALLOWED_STRENGTHS = {
+    "STRONG_ANSWER_AND_RELATION_MATCH",
+    "ANSWER_ONLY_MATCH"
+}
+
+CONTRADICTION_ALLOWED_STRENGTHS = {
+    "STRONG_ANSWER_AND_RELATION_MATCH",
+    "RELATION_ONLY_MATCH"
+}
+
+VALID_RETRIEVAL_SCOPES = {
+    "subject_page_filtered",
+    "subject_page"
+}
+
+
+def first_existing_path(paths, label):
+    for path in paths:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"No valid {label} file found. Checked: {paths}")
+
+
+STAGE3_PATH = first_existing_path(STAGE3_CANDIDATES, "Stage 3")
+STAGE4_PATH = first_existing_path(STAGE4_CANDIDATES, "Stage 4")
+
+print("Using Stage 3 file:", STAGE3_PATH)
+print("Using Stage 4 file:", STAGE4_PATH)
+
+
+# ============================================================
+# 2. Load files
+# ============================================================
+
+stage3_df = pd.read_csv(STAGE3_PATH)
+evidence_df = pd.read_csv(STAGE4_PATH)
+
+# Make row_index mean original Stage 3 row position.
+# This is needed because Stage 4 row_index points back to Stage 3.
+if "row_index" in stage3_df.columns:
+    stage3_df = stage3_df.drop(columns=["row_index"])
+
+stage3_df = stage3_df.reset_index(drop=True)
+stage3_df.insert(0, "row_index", stage3_df.index)
+
+print("\nStage 3 rows:", len(stage3_df))
+print("Stage 4 evidence rows:", len(evidence_df))
+
+required_stage3_cols = [
+    "row_index",
+    "id",
+    "question",
+    "reference_answer",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "model_answer_matches_reference",
+    "kg_only_prediction",
+    "stage3_answer_case",
+    "kg_fact_status_checked",
+    "relation_normalized",
+    "subject_popularity_bin"
+]
+
+required_stage4_cols = [
+    "row_index",
+    "claim",
+    "evidence_text",
+    "evidence_rank",
+    "retrieval_scope",
+    "evidence_strength",
+    "answer_grounded_in_evidence",
+    "relation_grounded_in_evidence",
+    "reranker_score"
+]
+
+missing_stage3 = [c for c in required_stage3_cols if c not in stage3_df.columns]
+missing_stage4 = [c for c in required_stage4_cols if c not in evidence_df.columns]
+
+if missing_stage3:
+    raise ValueError(f"Stage 3 is missing required columns: {missing_stage3}")
+
+if missing_stage4:
+    raise ValueError(f"Stage 4 is missing required columns: {missing_stage4}")
+
+
+# ============================================================
+# 3. Helper conversion functions
+# ============================================================
+
+def to_bool(value):
+    if isinstance(value, bool):
+        return value
+
+    if pd.isna(value):
+        return False
+
+    text = str(value).strip().lower()
+
+    return text in {"true", "1", "yes", "y"}
+
+
+def safe_float(value, default=0.0):
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        if pd.isna(value):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+# Normalize key boolean/numeric columns
+stage3_df["model_answer_matches_reference"] = stage3_df["model_answer_matches_reference"].apply(to_bool)
+
+evidence_df["answer_grounded_in_evidence"] = evidence_df["answer_grounded_in_evidence"].apply(to_bool)
+evidence_df["relation_grounded_in_evidence"] = evidence_df["relation_grounded_in_evidence"].apply(to_bool)
+evidence_df["evidence_rank"] = evidence_df["evidence_rank"].apply(safe_int)
+evidence_df["reranker_score"] = evidence_df["reranker_score"].apply(safe_float)
+
+evidence_df["claim"] = evidence_df["claim"].fillna("").astype(str)
+evidence_df["evidence_text"] = evidence_df["evidence_text"].fillna("").astype(str)
+evidence_df["retrieval_scope"] = evidence_df["retrieval_scope"].fillna("").astype(str)
+evidence_df["evidence_strength"] = evidence_df["evidence_strength"].fillna("NO_EVIDENCE").astype(str)
+
+print("\nKG-only prediction distribution:")
+print(stage3_df["kg_only_prediction"].value_counts())
+
+print("\nStage 3 answer case distribution:")
+print(stage3_df["stage3_answer_case"].value_counts())
+
+print("\nKG fact status distribution:")
+print(stage3_df["kg_fact_status_checked"].value_counts())
+
+print("\nStage 4 retrieval scope distribution:")
+print(evidence_df["retrieval_scope"].value_counts())
+
+print("\nStage 4 evidence strength distribution:")
+print(evidence_df["evidence_strength"].value_counts())
+
+
+# ============================================================
+# 4. Row alignment check
+# ============================================================
+
+alignment_cols = ["row_index", "id", "question"]
+
+stage3_alignment = stage3_df[alignment_cols].copy()
+
+stage4_alignment = (
+    evidence_df[alignment_cols]
+    .drop_duplicates(subset=["row_index"])
+    .copy()
+)
+
+alignment_check = stage4_alignment.merge(
+    stage3_alignment,
+    on="row_index",
+    how="left",
+    suffixes=("_stage4", "_stage3")
+)
+
+id_mismatch = (
+    alignment_check["id_stage4"].astype(str) !=
+    alignment_check["id_stage3"].astype(str)
+).sum()
+
+question_mismatch = (
+    alignment_check["question_stage4"].astype(str) !=
+    alignment_check["question_stage3"].astype(str)
+).sum()
+
+print("\nRow alignment check:")
+print("Stage 4 unique row_index values:", evidence_df["row_index"].nunique())
+print("ID mismatch count:", int(id_mismatch))
+print("Question mismatch count:", int(question_mismatch))
+
+if id_mismatch > 0 or question_mismatch > 0:
+    raise ValueError(
+        "Stage 4 row_index does not align with Stage 3. "
+        "Do not continue until Stage 4 is regenerated correctly."
+    )
+
+
+# ============================================================
+# 5. Prepare evidence rows for NLI
+# ============================================================
+
+valid_evidence_df = evidence_df[
+    (evidence_df["claim"].str.strip() != "") &
+    (evidence_df["evidence_text"].str.strip() != "") &
+    (evidence_df["evidence_rank"] > 0) &
+    (evidence_df["retrieval_scope"].isin(VALID_RETRIEVAL_SCOPES)) &
+    (evidence_df["evidence_strength"] != "NO_EVIDENCE")
+].copy().reset_index(drop=True)
+
+print("\nValid evidence rows for NLI:", len(valid_evidence_df))
+
+preview_cols = [
+    "row_index",
+    "claim",
+    "stage3_answer_case",
+    "evidence_rank",
+    "evidence_wiki_title",
+    "retrieval_scope",
+    "evidence_strength",
+    "answer_grounded_in_evidence",
+    "relation_grounded_in_evidence",
+    "reranker_score",
+    "evidence_text"
+]
+
+display(valid_evidence_df[preview_cols].head(15))
+
+
+# ============================================================
+# 6. Load NLI model
+# ============================================================
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("\nDevice:", device)
+
+if device == "cuda":
+    print("GPU:", torch.cuda.get_device_name(0))
+
+tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL_NAME)
+nli_model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL_NAME)
+
+nli_model.to(device)
+nli_model.eval()
+
+id2label = nli_model.config.id2label
+
+def normalize_nli_label(label):
+    label = str(label).lower()
+
+    if "entail" in label:
+        return "entailment"
+
+    if "contrad" in label:
+        return "contradiction"
+
+    if "neutral" in label:
+        return "neutral"
+
+    return label
+
+
+label_map = {
+    idx: normalize_nli_label(label)
+    for idx, label in id2label.items()
+}
+
+print("\nNLI model:", NLI_MODEL_NAME)
+print("Raw model labels:", id2label)
+print("Normalized label map:", label_map)
+
+
+# ============================================================
+# 7. Run evidence-level NLI
+# ============================================================
+
+def run_nli_batch(premises, hypotheses, batch_size=16, max_length=384):
+    rows = []
+
+    for start in tqdm(range(0, len(premises), batch_size)):
+        batch_premises = premises[start:start + batch_size]
+        batch_hypotheses = hypotheses[start:start + batch_size]
+
+        inputs = tokenizer(
+            batch_premises,
+            batch_hypotheses,
+            truncation=True,
+            padding=True,
+            max_length=max_length,
+            return_tensors="pt"
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = nli_model(**inputs)
+            probs = torch.softmax(outputs.logits, dim=-1).detach().cpu().numpy()
+
+        for prob_row in probs:
+            scores = {
+                label_map[i]: float(prob_row[i])
+                for i in range(len(prob_row))
+            }
+
+            entailment = scores.get("entailment", 0.0)
+            neutral = scores.get("neutral", 0.0)
+            contradiction = scores.get("contradiction", 0.0)
+
+            score_dict = {
+                "entailment": entailment,
+                "neutral": neutral,
+                "contradiction": contradiction
+            }
+
+            rows.append({
+                "nli_pred_label": max(score_dict, key=score_dict.get),
+                "nli_entailment_score": entailment,
+                "nli_neutral_score": neutral,
+                "nli_contradiction_score": contradiction
+            })
+
+    return pd.DataFrame(rows)
+
+
+if len(valid_evidence_df) > 0:
+    BATCH_SIZE = 16 if device == "cuda" else 4
+
+    nli_outputs = run_nli_batch(
+        valid_evidence_df["evidence_text"].tolist(),
+        valid_evidence_df["claim"].tolist(),
+        batch_size=BATCH_SIZE,
+        max_length=384
+    )
+
+    evidence_nli_df = pd.concat(
+        [valid_evidence_df.reset_index(drop=True), nli_outputs.reset_index(drop=True)],
+        axis=1
+    )
+
+else:
+    evidence_nli_df = valid_evidence_df.copy()
+
+    for col in [
+        "nli_pred_label",
+        "nli_entailment_score",
+        "nli_neutral_score",
+        "nli_contradiction_score"
+    ]:
+        evidence_nli_df[col] = []
+
+evidence_nli_df.to_csv(STAGE5_EVIDENCE_OUTPUT, index=False)
+
+print("\nSaved evidence-level NLI predictions:", STAGE5_EVIDENCE_OUTPUT)
+
+display(evidence_nli_df[[
+    "row_index",
+    "claim",
+    "stage3_answer_case",
+    "evidence_rank",
+    "evidence_strength",
+    "answer_grounded_in_evidence",
+    "relation_grounded_in_evidence",
+    "nli_pred_label",
+    "nli_entailment_score",
+    "nli_contradiction_score",
+    "nli_neutral_score",
+    "evidence_text"
+]].head(20))
+
+
+# ============================================================
+# 8. Safer aggregation per claim / Stage 3 row
+# ============================================================
+
+def aggregate_nli_group(group):
+    """
+    Key safety rules:
+    - Text support requires answer-grounded evidence.
+    - RELATION_ONLY_MATCH cannot support a claim.
+    - RELATION_ONLY_MATCH can contradict a claim.
+    - NO_EVIDENCE never enters this function.
+    """
+
+    group = group.copy()
+
+    group["support_allowed_by_grounding"] = (
+        group["answer_grounded_in_evidence"] &
+        group["evidence_strength"].isin(SUPPORT_ALLOWED_STRENGTHS)
+    )
+
+    group["contradiction_allowed_by_grounding"] = (
+        group["relation_grounded_in_evidence"] &
+        group["evidence_strength"].isin(CONTRADICTION_ALLOWED_STRENGTHS)
+    )
+
+    group["support_candidate_score"] = np.where(
+        (
+            group["support_allowed_by_grounding"] &
+            (group["nli_entailment_score"] >= THRESHOLDS["support_entailment_min"]) &
+            (group["nli_contradiction_score"] <= THRESHOLDS["support_contradiction_max"])
+        ),
+        group["nli_entailment_score"],
+        0.0
+    )
+
+    group["contradiction_candidate_score"] = np.where(
+        (
+            group["contradiction_allowed_by_grounding"] &
+            (group["nli_contradiction_score"] >= THRESHOLDS["contradiction_min"]) &
+            (group["nli_entailment_score"] <= THRESHOLDS["contradiction_entailment_max"])
+        ),
+        group["nli_contradiction_score"],
+        0.0
+    )
+
+    best_support_score = float(group["support_candidate_score"].max())
+    best_contradiction_score = float(group["contradiction_candidate_score"].max())
+
+    max_entailment_score = float(group["nli_entailment_score"].max())
+    max_contradiction_score = float(group["nli_contradiction_score"].max())
+    max_neutral_score = float(group["nli_neutral_score"].max())
+
+    if best_support_score > 0:
+        best_support_row = group.loc[group["support_candidate_score"].idxmax()]
+    else:
+        best_support_row = group.loc[group["nli_entailment_score"].idxmax()]
+
+    if best_contradiction_score > 0:
+        best_contradiction_row = group.loc[group["contradiction_candidate_score"].idxmax()]
+    else:
+        best_contradiction_row = group.loc[group["nli_contradiction_score"].idxmax()]
+
+    support_wins = (
+        best_support_score >= THRESHOLDS["support_entailment_min"] and
+        best_support_score >= best_contradiction_score + THRESHOLDS["support_margin"]
+    )
+
+    contradiction_wins = (
+        best_contradiction_score >= THRESHOLDS["contradiction_min"] and
+        best_contradiction_score >= best_support_score + THRESHOLDS["contradiction_margin"]
+    )
+
+    strict_contradiction_wins = (
+        best_contradiction_score >= THRESHOLDS["strict_contradiction_min"] and
+        best_support_score < THRESHOLDS["support_entailment_min"]
+    )
+
+    if support_wins:
+        verdict = EVIDENCE_SUPPORTED
+        best_row = best_support_row
+
+    elif contradiction_wins or strict_contradiction_wins:
+        verdict = EVIDENCE_CONTRADICTED
+        best_row = best_contradiction_row
+
+    else:
+        verdict = EVIDENCE_NOT_ENOUGH
+
+        group["max_nli_confidence"] = group[[
+            "nli_entailment_score",
+            "nli_neutral_score",
+            "nli_contradiction_score"
+        ]].max(axis=1)
+
+        best_row = group.loc[group["max_nli_confidence"].idxmax()]
+
+    return {
+        "row_index": int(best_row["row_index"]),
+        "id": best_row["id"],
+        "question": best_row["question"],
+        "claim": best_row["claim"],
+        "evidence_verdict": verdict,
+
+        "best_support_score": best_support_score,
+        "best_contradiction_score": best_contradiction_score,
+        "max_entailment_score": max_entailment_score,
+        "max_contradiction_score": max_contradiction_score,
+        "max_neutral_score": max_neutral_score,
+
+        "best_evidence_rank": int(best_row["evidence_rank"]),
+        "best_evidence_wiki_title": best_row.get("evidence_wiki_title", ""),
+        "best_evidence_text": best_row["evidence_text"],
+        "best_reranker_score": float(best_row["reranker_score"]),
+
+        "best_evidence_strength": best_row["evidence_strength"],
+        "best_answer_grounded_in_evidence": bool(best_row["answer_grounded_in_evidence"]),
+        "best_relation_grounded_in_evidence": bool(best_row["relation_grounded_in_evidence"]),
+        "best_matched_answer_term": best_row.get("matched_answer_term", ""),
+        "best_matched_relation_keyword": best_row.get("matched_relation_keyword", ""),
+
+        "best_nli_label": best_row["nli_pred_label"],
+        "best_nli_entailment_score": float(best_row["nli_entailment_score"]),
+        "best_nli_contradiction_score": float(best_row["nli_contradiction_score"]),
+        "best_nli_neutral_score": float(best_row["nli_neutral_score"]),
+
+        "num_evidence_rows_used": int(len(group)),
+        "num_support_candidates": int((group["support_candidate_score"] > 0).sum()),
+        "num_contradiction_candidates": int((group["contradiction_candidate_score"] > 0).sum())
+    }
+
+
+aggregated_rows = []
+
+for row_index, group in evidence_nli_df.groupby("row_index"):
+    aggregated_rows.append(aggregate_nli_group(group))
+
+aggregated_nli_df = pd.DataFrame(aggregated_rows)
+
+print("\nAggregated NLI rows:", len(aggregated_nli_df))
+
+if len(aggregated_nli_df) > 0:
+    print("\nEvidence verdict distribution:")
+    print(aggregated_nli_df["evidence_verdict"].value_counts())
+
+    display(aggregated_nli_df[[
+        "row_index",
+        "question",
+        "claim",
+        "evidence_verdict",
+        "best_support_score",
+        "best_contradiction_score",
+        "best_evidence_strength",
+        "best_answer_grounded_in_evidence",
+        "best_relation_grounded_in_evidence",
+        "best_evidence_text"
+    ]].head(20))
+
+
+# ============================================================
+# 9. Build final hybrid predictions
+# ============================================================
+
+final_df = stage3_df.copy()
+
+# Merge aggregated NLI verdicts back to full Stage 3 rows
+if len(aggregated_nli_df) > 0:
+    final_df = final_df.merge(
+        aggregated_nli_df,
+        on=["row_index", "id", "question"],
+        how="left"
+    )
+else:
+    for col in [
+        "claim",
+        "evidence_verdict",
+        "best_support_score",
+        "best_contradiction_score",
+        "max_entailment_score",
+        "max_contradiction_score",
+        "max_neutral_score",
+        "best_evidence_rank",
+        "best_evidence_wiki_title",
+        "best_evidence_text",
+        "best_reranker_score",
+        "best_evidence_strength",
+        "best_answer_grounded_in_evidence",
+        "best_relation_grounded_in_evidence",
+        "best_matched_answer_term",
+        "best_matched_relation_keyword",
+        "best_nli_label",
+        "best_nli_entailment_score",
+        "best_nli_contradiction_score",
+        "best_nli_neutral_score",
+        "num_evidence_rows_used",
+        "num_support_candidates",
+        "num_contradiction_candidates"
+    ]:
+        final_df[col] = np.nan
+
+final_df["evidence_verdict"] = final_df["evidence_verdict"].fillna(EVIDENCE_NOT_ENOUGH)
+
+# Default prediction
+final_df["hybrid_final_label"] = HYBRID_NOT_ENOUGH
+
+# KG-supported rows stay supported
+final_df.loc[
+    final_df["kg_only_prediction"] == KG_ONLY_SUPPORTED,
+    "hybrid_final_label"
+] = HYBRID_SUPPORTED_BY_KG
+
+# Unusable rows stay unusable
+final_df.loc[
+    final_df["kg_only_prediction"] == UNUSABLE_MODEL_ANSWER,
+    "hybrid_final_label"
+] = UNUSABLE_MODEL_ANSWER
+
+# Evidence-verified rows
+flagged_mask = final_df["kg_only_prediction"] == KG_ONLY_FLAGGED
+
+final_df.loc[
+    flagged_mask & (final_df["evidence_verdict"] == EVIDENCE_SUPPORTED),
+    "hybrid_final_label"
+] = HYBRID_VERIFIED_BY_TEXT
+
+final_df.loc[
+    flagged_mask & (final_df["evidence_verdict"] == EVIDENCE_CONTRADICTED),
+    "hybrid_final_label"
+] = HYBRID_CONTRADICTED_BY_TEXT
+
+print("\nHybrid final label distribution:")
+print(final_df["hybrid_final_label"].value_counts())
+
+display(final_df[[
+    "row_index",
+    "question",
+    "reference_answer",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "stage3_answer_case",
+    "kg_only_prediction",
+    "hybrid_final_label",
+    "evidence_verdict",
+    "best_support_score",
+    "best_contradiction_score",
+    "best_evidence_strength",
+    "best_answer_grounded_in_evidence",
+    "best_relation_grounded_in_evidence",
+    "best_evidence_text"
+]].head(30))
+
+
+# ============================================================
+# 10. Evaluation
+# ============================================================
+
+eval_df = final_df[
+    final_df["stage3_answer_case"] != UNUSABLE_MODEL_ANSWER
+].copy()
+
+eval_df["reference_binary_label"] = np.where(
+    eval_df["model_answer_matches_reference"],
+    NOT_HALLUCINATION,
+    HALLUCINATION
+)
+
+eval_df["kg_only_binary_prediction"] = np.where(
+    eval_df["kg_only_prediction"] == KG_ONLY_SUPPORTED,
+    NOT_HALLUCINATION,
+    HALLUCINATION
+)
+
+eval_df["hybrid_binary_prediction"] = np.where(
+    eval_df["hybrid_final_label"].isin([
+        HYBRID_SUPPORTED_BY_KG,
+        HYBRID_VERIFIED_BY_TEXT
+    ]),
+    NOT_HALLUCINATION,
+    HALLUCINATION
+)
+
+labels = [NOT_HALLUCINATION, HALLUCINATION]
+
+kg_only_accuracy = accuracy_score(
+    eval_df["reference_binary_label"],
+    eval_df["kg_only_binary_prediction"]
+)
+
+hybrid_accuracy = accuracy_score(
+    eval_df["reference_binary_label"],
+    eval_df["hybrid_binary_prediction"]
+)
+
+true_not_hallucination = eval_df["reference_binary_label"] == NOT_HALLUCINATION
+true_hallucination = eval_df["reference_binary_label"] == HALLUCINATION
+
+kg_false_hallucinations = eval_df[
+    true_not_hallucination &
+    (eval_df["kg_only_binary_prediction"] == HALLUCINATION)
+].copy()
+
+hybrid_false_hallucinations = eval_df[
+    true_not_hallucination &
+    (eval_df["hybrid_binary_prediction"] == HALLUCINATION)
+].copy()
+
+kg_false_hallucination_rate = (
+    len(kg_false_hallucinations) / int(true_not_hallucination.sum())
+    if int(true_not_hallucination.sum()) > 0
+    else 0.0
+)
+
+hybrid_false_hallucination_rate = (
+    len(hybrid_false_hallucinations) / int(true_not_hallucination.sum())
+    if int(true_not_hallucination.sum()) > 0
+    else 0.0
+)
+
+missing_fact_df = eval_df[
+    eval_df["stage3_answer_case"] == ANSWER_CORRECT_MISSING
+].copy()
+
+missing_fact_recovery_rate = (
+    (missing_fact_df["hybrid_final_label"] == HYBRID_VERIFIED_BY_TEXT).mean()
+    if len(missing_fact_df) > 0
+    else 0.0
+)
+
+false_acceptances = eval_df[
+    true_hallucination &
+    (eval_df["hybrid_binary_prediction"] == NOT_HALLUCINATION)
+].copy()
+
+false_acceptance_rate = (
+    len(false_acceptances) / int(true_hallucination.sum())
+    if int(true_hallucination.sum()) > 0
+    else 0.0
+)
+
+hybrid_cm = confusion_matrix(
+    eval_df["reference_binary_label"],
+    eval_df["hybrid_binary_prediction"],
+    labels=labels
+)
+
+kg_cm = confusion_matrix(
+    eval_df["reference_binary_label"],
+    eval_df["kg_only_binary_prediction"],
+    labels=labels
+)
+
+print("\n================ STAGE 5 FINAL HYBRID METRICS ================")
+print("Evaluated rows:", len(eval_df))
+
+print("\nKG-only accuracy:", round(float(kg_only_accuracy), 4))
+print("Hybrid accuracy:", round(float(hybrid_accuracy), 4))
+
+print("\nCorrect model answers:", int(true_not_hallucination.sum()))
+print("KG-only false hallucinations:", len(kg_false_hallucinations))
+print("Hybrid false hallucinations:", len(hybrid_false_hallucinations))
+
+print("\nKG-only false hallucination rate:", round(float(kg_false_hallucination_rate), 4))
+print("Hybrid false hallucination rate:", round(float(hybrid_false_hallucination_rate), 4))
+
+print("\nCorrect-but-fact-missing cases:", len(missing_fact_df))
+print("Missing fact recovery rate:", round(float(missing_fact_recovery_rate), 4))
+
+print("\nFalse acceptances introduced by hybrid:", len(false_acceptances))
+print("False acceptance rate:", round(float(false_acceptance_rate), 4))
+
+print("\nHybrid confusion matrix:")
+display(pd.DataFrame(
+    hybrid_cm,
+    index=[f"true_{x}" for x in labels],
+    columns=[f"pred_{x}" for x in labels]
+))
+
+print("\nHybrid classification report:")
+print(classification_report(
+    eval_df["reference_binary_label"],
+    eval_df["hybrid_binary_prediction"],
+    labels=labels,
+    zero_division=0
+))
+
+
+# ============================================================
+# 11. Relation and popularity breakdown
+# ============================================================
+
+relation_rows = []
+
+for relation, group in eval_df.groupby("relation_normalized"):
+    group_true_correct = group["reference_binary_label"] == NOT_HALLUCINATION
+
+    group_kg_false = group[
+        group_true_correct &
+        (group["kg_only_binary_prediction"] == HALLUCINATION)
+    ]
+
+    group_hybrid_false = group[
+        group_true_correct &
+        (group["hybrid_binary_prediction"] == HALLUCINATION)
+    ]
+
+    group_missing = group[group["stage3_answer_case"] == ANSWER_CORRECT_MISSING]
+
+    relation_rows.append({
+        "relation": relation,
+        "num_rows": int(len(group)),
+        "correct_model_answers": int(group_true_correct.sum()),
+        "kg_only_false_hallucinations": int(len(group_kg_false)),
+        "hybrid_false_hallucinations": int(len(group_hybrid_false)),
+        "kg_only_false_hallucination_rate": float(
+            len(group_kg_false) / int(group_true_correct.sum())
+            if int(group_true_correct.sum()) > 0 else 0.0
+        ),
+        "hybrid_false_hallucination_rate": float(
+            len(group_hybrid_false) / int(group_true_correct.sum())
+            if int(group_true_correct.sum()) > 0 else 0.0
+        ),
+        "correct_but_fact_missing_cases": int(len(group_missing)),
+        "missing_fact_recovery_rate": float(
+            (group_missing["hybrid_final_label"] == HYBRID_VERIFIED_BY_TEXT).mean()
+            if len(group_missing) > 0 else 0.0
+        )
+    })
+
+relation_breakdown = pd.DataFrame(relation_rows).sort_values(
+    "kg_only_false_hallucination_rate",
+    ascending=False
+)
+
+print("\nRelation-level breakdown:")
+display(relation_breakdown)
+
+
+popularity_rows = []
+
+for pop_bin, group in eval_df.groupby("subject_popularity_bin"):
+    group_true_correct = group["reference_binary_label"] == NOT_HALLUCINATION
+
+    group_kg_false = group[
+        group_true_correct &
+        (group["kg_only_binary_prediction"] == HALLUCINATION)
+    ]
+
+    group_hybrid_false = group[
+        group_true_correct &
+        (group["hybrid_binary_prediction"] == HALLUCINATION)
+    ]
+
+    group_missing = group[group["stage3_answer_case"] == ANSWER_CORRECT_MISSING]
+
+    popularity_rows.append({
+        "subject_popularity_bin": pop_bin,
+        "num_rows": int(len(group)),
+        "correct_model_answers": int(group_true_correct.sum()),
+        "kg_only_false_hallucinations": int(len(group_kg_false)),
+        "hybrid_false_hallucinations": int(len(group_hybrid_false)),
+        "kg_only_false_hallucination_rate": float(
+            len(group_kg_false) / int(group_true_correct.sum())
+            if int(group_true_correct.sum()) > 0 else 0.0
+        ),
+        "hybrid_false_hallucination_rate": float(
+            len(group_hybrid_false) / int(group_true_correct.sum())
+            if int(group_true_correct.sum()) > 0 else 0.0
+        ),
+        "correct_but_fact_missing_cases": int(len(group_missing)),
+        "missing_fact_recovery_rate": float(
+            (group_missing["hybrid_final_label"] == HYBRID_VERIFIED_BY_TEXT).mean()
+            if len(group_missing) > 0 else 0.0
+        )
+    })
+
+popularity_breakdown = pd.DataFrame(popularity_rows).sort_values(
+    "kg_only_false_hallucination_rate",
+    ascending=False
+)
+
+print("\nPopularity-level breakdown:")
+display(popularity_breakdown)
+
+
+# ============================================================
+# 12. Clean important examples
+# ============================================================
+
+print("\nRecovered missing-fact examples:")
+recovered_missing = missing_fact_df[
+    missing_fact_df["hybrid_final_label"] == HYBRID_VERIFIED_BY_TEXT
+].copy()
+
+display(recovered_missing[[
+    "question",
+    "reference_answer",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "stage3_answer_case",
+    "kg_only_prediction",
+    "hybrid_final_label",
+    "best_support_score",
+    "best_contradiction_score",
+    "best_evidence_strength",
+    "best_answer_grounded_in_evidence",
+    "best_evidence_text"
+]].head(15))
+
+
+print("\nCorrect missing-fact cases still not recovered:")
+not_recovered_missing = missing_fact_df[
+    missing_fact_df["hybrid_final_label"] != HYBRID_VERIFIED_BY_TEXT
+].copy()
+
+display(not_recovered_missing[[
+    "question",
+    "reference_answer",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "hybrid_final_label",
+    "evidence_verdict",
+    "best_support_score",
+    "best_contradiction_score",
+    "best_evidence_strength",
+    "best_answer_grounded_in_evidence",
+    "best_evidence_text"
+]].head(15))
+
+
+print("\nFalse acceptances preview:")
+display(false_acceptances[[
+    "question",
+    "reference_answer",
+    "model_raw_answer",
+    "model_extracted_answer",
+    "claim",
+    "hybrid_final_label",
+    "evidence_verdict",
+    "best_support_score",
+    "best_contradiction_score",
+    "best_evidence_strength",
+    "best_answer_grounded_in_evidence",
+    "best_evidence_text"
+]].head(15))
+
+
+# ============================================================
+# 13. Save outputs
+# ============================================================
+
+final_df.to_csv(STAGE5_FINAL_OUTPUT, index=False)
+
+metrics = {
+    "stage": "Stage 5 Final Safer Hybrid NLI Verification",
+    "input_stage3_file": STAGE3_PATH,
+    "input_stage4_file": STAGE4_PATH,
+    "evidence_level_output_file": STAGE5_EVIDENCE_OUTPUT,
+    "final_output_file": STAGE5_FINAL_OUTPUT,
+
+    "num_total_rows": int(len(final_df)),
+    "num_evaluated_rows": int(len(eval_df)),
+    "num_valid_evidence_rows_for_nli": int(len(valid_evidence_df)),
+    "num_aggregated_nli_rows": int(len(aggregated_nli_df)),
+
+    "nli_model": NLI_MODEL_NAME,
+    "thresholds": THRESHOLDS,
+
+    "kg_only_accuracy": float(kg_only_accuracy),
+    "hybrid_accuracy": float(hybrid_accuracy),
+
+    "correct_model_answers": int(true_not_hallucination.sum()),
+    "kg_only_false_hallucination_count": int(len(kg_false_hallucinations)),
+    "hybrid_false_hallucination_count": int(len(hybrid_false_hallucinations)),
+    "kg_only_false_hallucination_rate": float(kg_false_hallucination_rate),
+    "hybrid_false_hallucination_rate": float(hybrid_false_hallucination_rate),
+
+    "correct_but_fact_missing_cases": int(len(missing_fact_df)),
+    "missing_fact_recovery_rate": float(missing_fact_recovery_rate),
+
+    "false_acceptance_count": int(len(false_acceptances)),
+    "false_acceptance_rate": float(false_acceptance_rate),
+
+    "stage3_answer_case_distribution": final_df["stage3_answer_case"].value_counts().to_dict(),
+    "kg_only_prediction_distribution": final_df["kg_only_prediction"].value_counts().to_dict(),
+    "evidence_verdict_distribution": final_df["evidence_verdict"].value_counts().to_dict(),
+    "hybrid_final_label_distribution": final_df["hybrid_final_label"].value_counts().to_dict(),
+
+    "stage4_retrieval_scope_distribution": evidence_df["retrieval_scope"].value_counts().to_dict(),
+    "stage4_evidence_strength_distribution": evidence_df["evidence_strength"].value_counts().to_dict(),
+
+    "relation_breakdown": relation_breakdown.to_dict(orient="records"),
+    "subject_popularity_breakdown": popularity_breakdown.to_dict(orient="records"),
+
+    "kg_only_classification_report": classification_report(
+        eval_df["reference_binary_label"],
+        eval_df["kg_only_binary_prediction"],
+        labels=labels,
+        zero_division=0,
+        output_dict=True
+    ),
+
+    "hybrid_classification_report": classification_report(
+        eval_df["reference_binary_label"],
+        eval_df["hybrid_binary_prediction"],
+        labels=labels,
+        zero_division=0,
+        output_dict=True
+    ),
+
+    "kg_only_confusion_matrix_labels": labels,
+    "kg_only_confusion_matrix": kg_cm.tolist(),
+
+    "hybrid_confusion_matrix_labels": labels,
+    "hybrid_confusion_matrix": hybrid_cm.tolist(),
+
+    "label_definitions": {
+        "hybrid_final_label": {
+            HYBRID_SUPPORTED_BY_KG: "The answer is correct and the fact exists in the incomplete KG.",
+            HYBRID_VERIFIED_BY_TEXT: "The KG did not support the answer, but Wikipedia evidence verified it.",
+            HYBRID_CONTRADICTED_BY_TEXT: "Wikipedia evidence contradicts the model answer.",
+            HYBRID_NOT_ENOUGH: "No strong enough evidence was found to support or contradict the answer.",
+            UNUSABLE_MODEL_ANSWER: "The model output was not usable as a short entity answer."
+        },
+        "evidence_verdict": {
+            EVIDENCE_SUPPORTED: "NLI found strong answer-grounded textual support.",
+            EVIDENCE_CONTRADICTED: "NLI found strong relation-grounded textual contradiction.",
+            EVIDENCE_NOT_ENOUGH: "Evidence was absent, weak, or not safely grounded."
+        }
+    },
+
+    "important_safety_rules": {
+        "relation_only_evidence_can_support": False,
+        "relation_only_evidence_can_contradict": True,
+        "support_requires_answer_grounding": True,
+        "no_evidence_rows_stay_not_enough_evidence": True,
+        "manual_alias_map_used": False,
+        "uses_stage4_grounding_filters": True
+    }
+}
+
+with open(STAGE5_METRICS_OUTPUT, "w") as f:
+    json.dump(metrics, f, indent=2)
+
+print("\nSaved Stage 5 evidence-level NLI:", STAGE5_EVIDENCE_OUTPUT)
+print("Saved Stage 5 final predictions:", STAGE5_FINAL_OUTPUT)
+print("Saved Stage 5 metrics:", STAGE5_METRICS_OUTPUT)
+
+print("\nStage 5 complete.")
+print("\nFinal hybrid label distribution:")
+print(final_df["hybrid_final_label"].value_counts())
+
+print("\nKey final metrics:")
+print(json.dumps({
+    "kg_only_accuracy": metrics["kg_only_accuracy"],
+    "hybrid_accuracy": metrics["hybrid_accuracy"],
+    "kg_only_false_hallucination_rate": metrics["kg_only_false_hallucination_rate"],
+    "hybrid_false_hallucination_rate": metrics["hybrid_false_hallucination_rate"],
+    "missing_fact_recovery_rate": metrics["missing_fact_recovery_rate"],
+    "false_acceptance_rate": metrics["false_acceptance_rate"]
+}, indent=2))
