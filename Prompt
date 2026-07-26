@@ -1,0 +1,613 @@
+You are an award-winning UI/UX Designer, Creative Director, Senior Frontend Engineer, Three.js expert, Framer Motion specialist, and AI product designer.
+
+Your task is to build the most premium, modern, futuristic, interactive, and visually stunning personal portfolio website imaginable.
+
+This should not resemble a typical portfolio template. It should feel like a product launch website from Apple, Linear, Stripe, Vercel, OpenAI, or Nothing, while maintaining originality.
+
+==========================================
+ABOUT ME
+==========================================
+
+Name:
+Sanket Patra
+
+Role:
+Software Engineer | AI Engineer | DevOps Engineer | Full Stack Developer
+
+Experience:
+Professional software engineer with expertise in
+
+• Artificial Intelligence
+• LLM Applications
+• Agentic AI
+• DevOps
+• CI/CD
+• Jenkins
+• CloudBees
+• Docker
+• Kubernetes
+• GitHub
+• GitLab
+• Linux
+• AWS
+• Python
+• Java
+• Spring Boot
+• React
+• JavaScript
+• TypeScript
+• SQL
+• REST APIs
+• Microservices
+• Automation
+• System Design
+• Cloud Architecture
+
+I enjoy building scalable applications, intelligent automation systems, modern developer platforms, and AI-powered products.
+
+The website should communicate:
+"Engineering elegant systems powered by intelligence."
+
+==========================================
+OVERALL DESIGN GOAL
+==========================================
+
+This should look like a $50,000 custom portfolio.
+
+The first reaction of visitors should be:
+
+"Wow."
+
+Everything must feel premium.
+
+Avoid ordinary portfolio layouts.
+
+Avoid Bootstrap-looking pages.
+
+Avoid boring sections.
+
+Avoid generic cards.
+
+No stock designs.
+
+Every section should have motion.
+
+Every interaction should feel intentional.
+
+Every animation should improve storytelling.
+
+==========================================
+DESIGN STYLE
+==========================================
+
+Blend inspiration from
+
+Apple
+
+OpenAI
+
+Stripe
+
+Linear
+
+Vercel
+
+Framer
+
+Nothing
+
+Tesla
+
+GitHub
+
+Awwwards
+
+Lusion
+
+Locomotive
+
+Use glassmorphism only where appropriate.
+
+Use neumorphism sparingly.
+
+Use gradients tastefully.
+
+Use depth.
+
+Use ambient lighting.
+
+Use floating objects.
+
+Use subtle particles.
+
+Use parallax.
+
+Use premium typography.
+
+Use smooth page transitions.
+
+Use cinematic spacing.
+
+Use premium iconography.
+
+Use layered backgrounds.
+
+Create a futuristic atmosphere.
+
+==========================================
+COLOR PALETTE
+==========================================
+
+Dark Theme
+
+Background:
+#050816
+
+Secondary:
+#0F172A
+
+Accent colors
+
+Electric Blue
+
+Purple
+
+Cyan
+
+White
+
+Tiny gradients.
+
+No oversaturated colors.
+
+==========================================
+SCROLL EXPERIENCE
+==========================================
+
+Scrolling should tell a story.
+
+Every section appears with smooth animations.
+
+Sticky transitions.
+
+Horizontal scrolling where appropriate.
+
+Scroll-triggered animations.
+
+Pinned sections.
+
+Morphing backgrounds.
+
+Dynamic lighting.
+
+Progress indicator.
+
+Section transitions.
+
+==========================================
+LANDING PAGE
+==========================================
+
+Hero section should be breathtaking.
+
+Large animated typography.
+
+"My name"
+
+Dynamic role changing animation
+
+Software Engineer
+
+AI Engineer
+
+DevOps Engineer
+
+Full Stack Engineer
+
+Automation Architect
+
+Typing animation.
+
+Animated gradient background.
+
+Mouse-following glow.
+
+3D floating objects.
+
+Interactive particles.
+
+Animated grid.
+
+Three.js scene.
+
+CTA buttons:
+
+View Projects
+
+Download Resume
+
+Contact Me
+
+GitHub
+
+LinkedIn
+
+==========================================
+BACKGROUND EFFECTS
+==========================================
+
+Aurora gradients
+
+Animated blobs
+
+Noise texture
+
+Particle system
+
+Stars
+
+Constellation lines
+
+Animated mesh gradients
+
+Floating code snippets
+
+Circuit animations
+
+Neural network animation
+
+Wave animations
+
+==========================================
+ABOUT SECTION
+==========================================
+
+Not a boring paragraph.
+
+Split layout.
+
+Animated timeline.
+
+Interactive image placeholder.
+
+Highlight achievements.
+
+Animated counters.
+
+Hover effects.
+
+Interesting typography.
+
+==========================================
+SKILLS SECTION
+==========================================
+
+This should be one of the highlights.
+
+Interactive skill galaxy.
+
+3D rotating sphere.
+
+Technology orbit.
+
+Hover reveals experience.
+
+Animated proficiency bars.
+
+Icons glowing.
+
+Skill filtering.
+
+Search.
+
+Categories.
+
+Frontend
+
+Backend
+
+DevOps
+
+Cloud
+
+AI
+
+Programming
+
+Tools
+
+==========================================
+PROJECT SECTION
+==========================================
+
+Highly interactive.
+
+Each project expands.
+
+Smooth hover.
+
+Video preview.
+
+Live demo.
+
+GitHub.
+
+Tech stack.
+
+Challenges solved.
+
+Architecture diagram.
+
+Animated screenshots.
+
+Parallax images.
+
+Cards should tilt with mouse.
+
+==========================================
+TIMELINE
+==========================================
+
+Beautiful vertical timeline.
+
+Animated as scrolling.
+
+Professional journey.
+
+Education.
+
+Experience.
+
+Milestones.
+
+==========================================
+ACHIEVEMENTS
+==========================================
+
+Animated statistics.
+
+Certificates.
+
+Awards.
+
+Open Source.
+
+Hackathons.
+
+GitHub contributions.
+
+==========================================
+AI SECTION
+==========================================
+
+Dedicated futuristic section.
+
+Showcase
+
+LLMs
+
+RAG
+
+Prompt Engineering
+
+AI Agents
+
+Automation
+
+Vector Databases
+
+Model Integrations
+
+Animated neural network visualization.
+
+==========================================
+DEVOPS SECTION
+==========================================
+
+Interactive CI/CD pipeline visualization.
+
+Animated deployment.
+
+Docker containers.
+
+Kubernetes clusters.
+
+Jenkins.
+
+Cloud.
+
+Infrastructure animations.
+
+==========================================
+CONTACT
+==========================================
+
+Beautiful futuristic contact form.
+
+Floating labels.
+
+Animated send button.
+
+Social links.
+
+Map.
+
+Availability indicator.
+
+==========================================
+MICROINTERACTIONS
+==========================================
+
+Buttons should ripple.
+
+Hover should glow.
+
+Cards should tilt.
+
+Cursor effects.
+
+Magnetic buttons.
+
+Smooth scrolling.
+
+Parallax.
+
+Motion blur.
+
+Glass reflections.
+
+Gradient movement.
+
+==========================================
+ANIMATIONS
+==========================================
+
+Use
+
+Framer Motion
+
+GSAP
+
+Lenis Smooth Scroll
+
+Three.js
+
+Spline
+
+Lottie
+
+React Spring
+
+Canvas animations
+
+Intersection Observer
+
+Everything must remain performant.
+
+==========================================
+TECH STACK
+==========================================
+
+React
+
+Next.js
+
+TypeScript
+
+TailwindCSS
+
+Framer Motion
+
+GSAP
+
+Three.js
+
+React Three Fiber
+
+Shadcn UI
+
+Lucide Icons
+
+Spline
+
+Lenis
+
+Vercel Fonts
+
+==========================================
+PERFORMANCE
+==========================================
+
+100 Lighthouse score if possible.
+
+SEO optimized.
+
+Accessibility.
+
+Lazy loading.
+
+Image optimization.
+
+Responsive.
+
+Code splitting.
+
+Reusable components.
+
+Maintainable architecture.
+
+==========================================
+RESPONSIVENESS
+==========================================
+
+Desktop
+
+Laptop
+
+Tablet
+
+Mobile
+
+Ultra-wide monitors
+
+==========================================
+BONUS WOW FEATURES
+==========================================
+
+AI assistant floating widget.
+
+Command palette.
+
+Spotlight search.
+
+Terminal mode.
+
+Secret easter egg.
+
+Keyboard shortcuts.
+
+Theme switcher.
+
+Music toggle.
+
+Interactive code playground.
+
+Animated terminal.
+
+Live GitHub stats.
+
+Contribution graph.
+
+Visitor counter.
+
+Current local time.
+
+Weather widget.
+
+Custom loading animation.
+
+Page transition animations.
+
+Scroll percentage.
+
+Dynamic cursor.
+
+==========================================
+DELIVERABLES
+==========================================
+
+Generate a complete production-ready application.
+
+Use clean architecture.
+
+Component-based design.
+
+Professional folder structure.
+
+Every component should be reusable.
+
+Write elegant code.
+
+Include comments only where necessary.
+
+The final result should be worthy of being featured on Awwwards and should leave recruiters and engineering managers genuinely impressed.
